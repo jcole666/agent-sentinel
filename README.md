@@ -22,7 +22,7 @@
 |---|---|
 | Claude Code | hooks 自动上报（任务/工具/待审批/完成） |
 | Codex | config.toml notify 自动上报 |
-| DeepSeek Harness | 进程检测 + 通用 POST 上报 |
+| DeepSeek Harness | **窗口标题监听**（一开工就显示任务名）+ 通用 POST 上报 |
 | Claude Desktop / WorkBuddy 国内版 / 国际版 | 进程检测 + 手动标记（GUI 应用无对外接口） |
 
 ## 安装与启动
@@ -41,6 +41,23 @@ Windows 下双击 `启动哨兵.vbs` 可静默后台启动（可用环境变量 
 - 宠物永远置顶；**滚轮缩放**（0.7×～3.0×），或**右键宠物**选预设尺寸，尺寸自动记忆
 - **点宠物**：原地展开/收起面板（面板向左展开，宠物不动）；**按住拖动**：移动位置
 - 面板里：右键某一行手动标记，双击行=快捷完成，︿ 收回，— 隐藏到托盘
+
+## 窗口标题监听（给没有 hook 的 GUI 应用）
+
+DeepSeek Harness 这类应用没有对外接口，但它的窗口标题会带当前会话/任务名
+（例如 `问候 — DeepSeek Harness`）。哨兵每 2 秒扫一次窗口标题：
+
+- 标题带任务名 → 立刻显示为**工作中**，任务名就是标题里那段
+- 进程树持续 12 分钟无 CPU 活动 → 自动转为**已完成**（`idle_minutes` 可调）
+- 窗口关闭或标题回到纯应用名 → 清空
+
+配置在 `config.json` 的 `watch_window`：
+
+```json
+"watch_window": { "process": "deepseek harness.exe", "title_suffix": "DeepSeek Harness", "idle_minutes": 12 }
+```
+
+其它 GUI 应用同理，填上进程名和标题后缀即可（标题里没有任务名的应用无法用这招，仍是手动标记）。
 
 ## 上报接口
 

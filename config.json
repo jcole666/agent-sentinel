@@ -22,7 +22,12 @@
       "id": "deepseek-harness",
       "label": "DeepSeek Harness",
       "kind": "gui",
-      "proc_match": { "name": "deepseek harness.exe", "path_contains": "deepseekharness" }
+      "proc_match": { "name": "deepseek harness.exe", "path_contains": "deepseekharness" },
+      "watch_window": {
+        "process": "deepseek harness.exe",
+        "title_suffix": "DeepSeek Harness",
+        "idle_minutes": 12
+      }
     },
     {
       "id": "workbuddy-cn",

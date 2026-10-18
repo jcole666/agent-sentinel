@@ -229,6 +229,111 @@ def run_http_server(store, stop_event):
 # ---------------------------------------------------------------- 进程监控
 
 
+def enum_windows():
+    """ 枚举可见窗口 -> [(hwnd, title, pid)]，仅 Windows """
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        proto = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        out = []
+
+        def cb(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                n = user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if buf.value.strip():
+                    out.append((hwnd, buf.value.strip(), pid.value))
+            return True
+        user32.EnumWindows(proto(cb), 0)
+        return out
+    except Exception:
+        return []
+
+
+def run_window_watcher(store, agents, stop_event):
+    """ 监听 GUI Agent 的窗口标题：标题里带任务名的，一开工就立刻显示为工作中。
+    进程树长时间无 CPU 活动则视为已完成（idle_minutes 可调）。 """
+    watched = [(a["id"], a["watch_window"]) for a in agents if a.get("watch_window")]
+    if not watched:
+        return
+    last_active = {}
+
+    def proc_name(pid):
+        try:
+            return (psutil.Process(pid).name() or "").lower()
+        except Exception:
+            return ""
+
+    def tree_cpu(pid):
+        """ 进程及其子进程的 CPU 占用合计（%） """
+        total = 0.0
+        try:
+            root = psutil.Process(pid)
+            procs = [root] + root.children(recursive=True)
+            for p in procs:
+                try:
+                    total += p.cpu_percent(interval=0.15)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return total
+
+    while not stop_event.is_set():
+        try:
+            wins = enum_windows()
+            for aid, cfg in watched:
+                want_proc = (cfg.get("process") or "").lower()
+                suffix = cfg.get("title_suffix", "")
+                hit = None
+                for _hwnd, title, pid in wins:
+                    if want_proc and proc_name(pid) != want_proc:
+                        continue
+                    if suffix and not title.endswith(suffix):
+                        continue
+                    hit = (title, pid)
+                    break
+
+                TASK_ID = "window"
+                if not hit:
+                    # 窗口不在 / 标题回到纯应用名 → 视为无任务
+                    if aid in last_active:
+                        last_active.pop(aid, None)
+                        store.report(aid, "idle", task_id=TASK_ID)
+                    continue
+
+                title, pid = hit
+                name = title
+                for sep in ("—", "-", "–"):
+                    if sep in title:
+                        name = title.rsplit(sep, 1)[0].strip()
+                        break
+                if not name or name == suffix:
+                    if aid in last_active:
+                        last_active.pop(aid, None)
+                        store.report(aid, "idle", task_id=TASK_ID)
+                    continue
+
+                cpu = tree_cpu(pid)
+                now = time.time()
+                if cpu > 1.0:
+                    last_active[aid] = now
+
+                idle_min = float(cfg.get("idle_minutes", 12))
+                quiet_for = now - last_active.get(aid, now)
+                state = "done" if quiet_for > idle_min * 60 else "working"
+                store.report(aid, state, name, task_id=TASK_ID)
+        except Exception:
+            pass
+        stop_event.wait(2.0)
+
+
 def run_proc_watcher(store, agents, stop_event):
     while not stop_event.is_set():
         try:
@@ -705,6 +810,7 @@ def main():
     stop_event = threading.Event()
     threading.Thread(target=run_http_server, args=(store, stop_event), daemon=True).start()
     threading.Thread(target=run_proc_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_window_watcher, args=(store, agents, stop_event), daemon=True).start()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
