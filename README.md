@@ -23,7 +23,8 @@
 | Claude Code | hooks 自动上报（任务/工具/待审批/完成） |
 | Codex | config.toml notify 自动上报 |
 | DeepSeek Harness | **窗口标题监听**（一开工就显示任务名）+ 通用 POST 上报 |
-| Claude Desktop / WorkBuddy 国内版 / 国际版 | 进程检测 + 手动标记（GUI 应用无对外接口） |
+| WorkBuddy 国内版 / 国际版 | **本地 SQLite 会话表监听**（自动显示会话标题与状态） |
+| Claude Desktop | 进程检测 + 手动标记（无对外接口、无本地会话表） |
 
 ## 安装与启动
 
@@ -59,6 +60,20 @@ DeepSeek Harness 这类应用没有对外接口，但它的窗口标题会带当
 ```
 
 其它 GUI 应用同理，填上进程名和标题后缀即可（标题里没有任务名的应用无法用这招，仍是手动标记）。
+
+## 本地会话库监听（WorkBuddy）
+
+WorkBuddy 把会话元数据写在本地 SQLite 里（`sessions` 表有 `title` / `status` / `last_activity_at`）。
+哨兵每 3 秒只读查询一次，显示**正在进行的会话标题和状态**，不需要 Agent 配合上报，
+旧会话继续聊也会自动更新。
+
+```json
+"watch_db": { "path": "%USERPROFILE%\\.workbuddy\\workbuddy.db", "active_minutes": 8 }
+```
+
+- 国内版：`%USERPROFILE%\.workbuddy\workbuddy.db`；国际版：`%USERPROFILE%\.workbuddy-ai\workbuddy.db`
+- 只读打开，**只取 id/标题/状态/时间，不读任何会话内容**
+- `active_minutes`：多久没有活动就认为该会话已结束
 
 ## 上报接口
 

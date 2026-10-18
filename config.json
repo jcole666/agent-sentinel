@@ -37,13 +37,15 @@
       "id": "workbuddy-cn",
       "label": "WorkBuddy 国内版",
       "kind": "gui",
-      "proc_match": { "name": "workbuddy.exe", "path_contains": "" }
+      "proc_match": { "name": "workbuddy.exe", "path_contains": "" },
+      "watch_db": { "path": "%USERPROFILE%\\.workbuddy\\workbuddy.db", "active_minutes": 8 }
     },
     {
       "id": "workbuddy-intl",
       "label": "WorkBuddy 国际版",
       "kind": "gui",
-      "proc_match": { "name": "workbuddyai.exe", "path_contains": "" }
+      "proc_match": { "name": "workbuddyai.exe", "path_contains": "" },
+      "watch_db": { "path": "%USERPROFILE%\\.workbuddy-ai\\workbuddy.db", "active_minutes": 8 }
     }
   ]
 }

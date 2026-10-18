@@ -257,6 +257,52 @@ def enum_windows():
         return []
 
 
+def run_db_watcher(store, agents, stop_event):
+    """ 读取 GUI Agent 的本地 SQLite（如 WorkBuddy 的 sessions 表）：
+    有正在进行的会话就显示其标题与状态，完全不依赖 Agent 自觉上报。
+    只读打开，不涉及任何会话内容，只取 id/标题/状态/时间。 """
+    watched = [(a["id"], a["watch_db"]) for a in agents if a.get("watch_db")]
+    if not watched:
+        return
+    import sqlite3
+    seen = {}
+    while not stop_event.is_set():
+        try:
+            now_ms = int(time.time() * 1000)
+            for aid, cfg in watched:
+                path = os.path.expandvars(cfg.get("path", ""))
+                if not path or not os.path.exists(path):
+                    continue
+                active_min = float(cfg.get("active_minutes", 8))
+                con = sqlite3.connect("file:" + path.replace("\\", "/") + "?mode=ro",
+                                      uri=True, timeout=1.0)
+                try:
+                    rows = list(con.execute(
+                        "SELECT id, COALESCE(custom_title, title, ''), status, last_activity_at "
+                        "FROM sessions WHERE deleted_at IS NULL AND last_activity_at > ? "
+                        "ORDER BY last_activity_at DESC LIMIT 5",
+                        (now_ms - int(active_min * 60000),)))
+                except sqlite3.Error:
+                    rows = []
+                finally:
+                    con.close()
+
+                cur_ids = set()
+                for sid, title, status, _last in rows:
+                    if not title:
+                        continue
+                    tid = "db-" + str(sid)[:8]
+                    cur_ids.add(tid)
+                    state = "working" if status == "working" else "done"
+                    store.report(aid, state, str(title)[:60], task_id=tid)
+                for gone in (seen.get(aid, set()) - cur_ids):
+                    store.report(aid, "idle", task_id=gone)
+                seen[aid] = cur_ids
+        except Exception:
+            pass
+        stop_event.wait(3.0)
+
+
 def run_window_watcher(store, agents, stop_event):
     """ 监听 GUI Agent 的窗口标题：标题里带任务名的，一开工就立刻显示为工作中。
     进程树长时间无 CPU 活动则视为已完成（idle_minutes 可调）。 """
@@ -848,6 +894,7 @@ def main():
     threading.Thread(target=run_http_server, args=(store, stop_event), daemon=True).start()
     threading.Thread(target=run_proc_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_window_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_db_watcher, args=(store, agents, stop_event), daemon=True).start()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
