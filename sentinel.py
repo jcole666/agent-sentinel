@@ -817,8 +817,28 @@ class SentinelWindow(QWidget):
 # ---------------------------------------------------------------- 入口
 
 
+def already_running():
+    """ 端口已被占 = 已有实例在跑，不再开第二个宠物 """
+    import socket
+    s = socket.socket()
+    s.settimeout(0.4)
+    try:
+        s.connect((HOST, PORT))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def main():
     global CONFIG
+    if already_running():
+        print("Agent 哨兵已在运行（端口 %d 已占用），本次不重复启动。" % PORT)
+        sys.exit(0)
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         CONFIG = json.load(f)
     agents = CONFIG["agents"]

@@ -1,5 +1,6 @@
-' 双击静默启动 Agent 哨兵（无控制台窗口）
-' Python 解析顺序：环境变量 SENTINEL_PYTHON > 常见受管 venv > PATH 里的 pythonw
+' Agent Sentinel - silent launcher
+' IMPORTANT: keep this file pure ASCII. Windows Script Host reads .vbs as ANSI,
+' so any non-ASCII character (Chinese comments etc.) makes the script fail silently.
 Dim fso, shell, dir, py, candidates, i
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
@@ -21,6 +22,11 @@ If py = "" Then
 End If
 
 If py = "" Then py = "pythonw.exe"
+
+If Not fso.FileExists(dir & "\sentinel.py") Then
+    MsgBox "sentinel.py not found in " & dir, 16, "Agent Sentinel"
+    WScript.Quit 1
+End If
 
 shell.CurrentDirectory = dir
 shell.Run """" & py & """ """ & dir & "\sentinel.py""", 0, False
