@@ -14,7 +14,15 @@
       "id": "claude-desktop",
       "label": "Claude Desktop",
       "kind": "gui",
-      "proc_match": { "name": "claude.exe", "path_contains": "windowsapps\\claude_" }
+      "proc_match": { "name": "claude.exe", "path_contains": "windowsapps\\claude_" },
+      "watch_json": {
+        "session_glob": [
+          "%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\*\\00000000\\local_*.json",
+          "%LOCALAPPDATA%\\Claude-3p\\session-sync\\*\\local_*.json"
+        ],
+        "active_seconds": 150,
+        "done_minutes": 20
+      }
     },
     {
       "id": "codex",

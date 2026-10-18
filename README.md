@@ -24,7 +24,7 @@
 | Codex | **本地回合库监听**（实时，含任务标题）+ config.toml notify 兜底 |
 | DeepSeek Harness | **窗口标题监听**（一开工就显示任务名）+ 通用 POST 上报 |
 | WorkBuddy 国内版 / 国际版 | **本地 SQLite 会话表监听**（自动显示会话标题与状态） |
-| Claude Desktop | 进程检测 + 手动标记（无对外接口、无本地会话表） |
+| Claude Desktop | **本地会话 JSON + 回合记录监听**（实时，含会话标题） |
 
 ## 安装与启动
 
@@ -92,6 +92,35 @@ WorkBuddy 把会话元数据写在本地 SQLite 里（`sessions` 表有 `title` 
 - 国内版：`%USERPROFILE%\.workbuddy\workbuddy.db`；国际版：`%USERPROFILE%\.workbuddy-ai\workbuddy.db`
 - 只读打开，**只取 id/标题/状态/时间，不读任何会话内容**
 - `active_minutes`：多久没有活动就认为该会话已结束
+
+## 本地会话 JSON 监听（Claude Desktop）
+
+Claude Desktop 的本地 agent 会话会写到磁盘，不需要它配合上报：
+
+- 会话元数据：`%LOCALAPPDATA%\Claude-3p\local-agent-mode-sessions\*\00000000\local_<uuid>.json`
+  里面有 `title` / `lastActivityAt` / `isArchived`
+- 回合记录：`<会话短 id>\.claude\projects\session\*.jsonl`，**实时追加**
+
+判断「进行中」的关键：一个回合执行期间，jsonl 会每 30～120 秒追加一条 `system` 心跳；
+只有回合结束才会追加一条带 `stop_reason` 的 `assistant` 记录。
+所以哨兵看文件末尾——最后一条是 `assistant`（有 `stop_reason`）就判已完成，否则判进行中。
+
+```json
+"watch_json": {
+  "session_glob": [
+    "%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\*\\00000000\\local_*.json",
+    "%LOCALAPPDATA%\\Claude-3p\\session-sync\\*\\local_*.json"
+  ],
+  "active_seconds": 150,
+  "done_minutes": 20
+}
+```
+
+- `active_seconds`：末尾记录的时效窗口（要大于心跳间隔，默认 150 秒）
+- `done_minutes`：回合结束后「已完成」状态保留多久
+- 只读，**只取标题与时间，不读消息正文**
+
+> 注意：只覆盖 Claude Desktop 的**本地 agent 模式**会话。纯云端聊天不会在本地落盘，哨兵无法感知。
 
 ## 上报接口
 

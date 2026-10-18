@@ -8,6 +8,7 @@ Agent 哨兵 (Agent Sentinel)
 - 状态：idle 空闲 / working 工作中 / approval 等待审批 / done 已完成 / error 出错
 """
 
+import datetime
 import json
 import os
 import subprocess
@@ -361,6 +362,157 @@ def run_db_watcher(store, agents, stop_event):
                 for gone in (seen.get(aid, set()) - cur_ids):
                     store.report(aid, "idle", task_id=gone)
                 seen[aid] = cur_ids
+        except Exception:
+            pass
+        stop_event.wait(3.0)
+
+
+def run_json_watcher(store, agents, stop_event):
+    """ 读取把会话写成 JSON 文件的 Agent（如 Claude Desktop 的 local-agent-mode）。
+
+    Claude Desktop 每个本地会话在
+      %LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\<acct>\\00000000\\
+    下放一份 local_<uuid>.json（含 title / lastActivityAt），
+    并在 <short>\\.claude\\projects\\session\\*.jsonl 里实时追加回合记录。
+
+    判断「进行中」的关键：回合执行期间 jsonl 会周期性追加 system 心跳，
+    回合结束才会追加一条带 stop_reason 的 assistant 记录。
+    所以：最后一条是 assistant(有 stop_reason) => 已完成；否则 => 进行中。
+    只读，只取标题与时间，不读消息正文。 """
+    watched = [(a["id"], a["watch_json"]) for a in agents if a.get("watch_json")]
+    if not watched:
+        return
+    import glob as _glob
+    seen = {}
+
+    def ts_of(v):
+        """ 时间是 ISO 字符串（UTC），统一转成 epoch 秒 """
+        if isinstance(v, (int, float)):
+            return float(v) / (1000.0 if v > 1e11 else 1.0)
+        if isinstance(v, str):
+            try:
+                s = v.replace("Z", "+00:00")
+                return datetime.datetime.fromisoformat(s).timestamp()
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def scan_transcript(path):
+        """ 返回 (最后一条时间戳, 是否已完成, 最后 user 消息摘要) """
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh.read().splitlines()
+        except Exception:
+            return 0.0, False, ""
+        last_ts = 0.0
+        assistant_ts = 0.0
+        finished = False
+        prompt = ""
+        for line in lines[-80:]:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            t = ts_of(d.get("timestamp"))
+            if t > last_ts:
+                last_ts = t
+            typ = d.get("type")
+            msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+            if typ == "assistant" or msg.get("role") == "assistant":
+                if t >= assistant_ts:
+                    assistant_ts = t
+                    finished = bool(msg.get("stop_reason"))
+            if not prompt and (typ == "user" or msg.get("role") == "user"):
+                c = msg.get("content")
+                if isinstance(c, str):
+                    prompt = c
+                elif isinstance(c, list):
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            prompt = str(b.get("text", ""))
+                            break
+        if assistant_ts and assistant_ts >= last_ts - 2:
+            return last_ts, finished, prompt
+        return last_ts, False, prompt
+
+    while not stop_event.is_set():
+        try:
+            now = time.time()
+            for aid, cfg in watched:
+                raw_pat = cfg.get("session_glob", "")
+                patterns = raw_pat if isinstance(raw_pat, list) else [raw_pat]
+                patterns = [os.path.expandvars(p) for p in patterns if p]
+                if not patterns:
+                    continue
+                active_sec = float(cfg.get("active_seconds", 150))
+                done_min = float(cfg.get("done_minutes", 20))
+                cur = set()
+                sfs = []
+                for p in patterns:
+                    sfs += _glob.glob(p)
+                for sf in sfs:
+                    try:
+                        with open(sf, "r", encoding="utf-8", errors="ignore") as fh:
+                            meta = json.load(fh)
+                    except Exception:
+                        continue
+                    if meta.get("isArchived"):
+                        continue
+                    sid = str(meta.get("sessionId") or os.path.basename(sf))
+                    short = sid.split("_")[-1].split("-")[0] if "_" in sid else sid[:8]
+                    base = os.path.dirname(sf)
+                    title = (meta.get("title") or "").strip()
+                    live = ts_of(meta.get("lastActivityAt"))
+
+                    # 该会话的 transcript。注意：Windows 下 glob 的 "**" 递归
+                    # 不会进入以点号开头的目录（如 .claude），必须用显式路径。
+                    cands = []
+                    for rel in (
+                        (short, ".claude", "projects", "session", "*.jsonl"),
+                        (short, ".claude", "projects", "*", "*.jsonl"),
+                        (short + "*", ".claude", "projects", "session", "*.jsonl"),
+                    ):
+                        cands += _glob.glob(os.path.join(base, *rel))
+                    extra = cfg.get("transcript_glob")
+                    if extra:
+                        for p in _glob.glob(os.path.expandvars(
+                                extra.replace("{short}", short))):
+                            cands.append(p)
+                    t_last, t_done, prompt = 0.0, False, ""
+                    for tp in cands[:6]:
+                        try:
+                            mt = os.path.getmtime(tp)
+                        except Exception:
+                            continue
+                        if mt - t_last > 0:
+                            a, b, c = scan_transcript(tp)
+                            if a > t_last:
+                                t_last, t_done, prompt = a, b, c
+                    try:
+                        live = max(live, os.path.getmtime(sf))
+                    except Exception:
+                        pass
+
+                    newest = max(live, t_last)
+                    if not title:
+                        title = (prompt or "会话").strip()[:40]
+                    if not title:
+                        continue
+                    task_id = "js-" + short
+
+                    if t_last and not t_done and (now - t_last) < active_sec:
+                        state = "working"
+                        cur.add(task_id)
+                    elif (now - newest) < done_min * 60:
+                        state = "done"
+                        cur.add(task_id)
+                    else:
+                        continue
+                    store.report(aid, state, title[:60], task_id=task_id)
+
+                for gone in (seen.get(aid, set()) - cur):
+                    store.report(aid, "idle", task_id=gone)
+                seen[aid] = cur
         except Exception:
             pass
         stop_event.wait(3.0)
@@ -959,6 +1111,7 @@ def main():
     threading.Thread(target=run_window_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_db_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_turn_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_json_watcher, args=(store, agents, stop_event), daemon=True).start()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
