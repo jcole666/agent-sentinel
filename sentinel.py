@@ -29,6 +29,7 @@ PORT = 17890
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
+CONFIG = {}   # config.json 全量内容，main() 里加载
 
 # 简约配色：黑白灰为主，仅待审批用红色作唯一强调色
 STATE_META = {
@@ -520,9 +521,16 @@ class PetWidget(QWidget):
     BASE = 68          # 1.0 倍尺寸
     MIN_SCALE, MAX_SCALE = 0.7, 3.0
 
-    def __init__(self, on_toggle, on_move, on_press, store=None):
+    # 安静模式：整体放慢（倍数越大越慢），空闲时大部分时间保持静止
+    CALM_SLOW = {"idle": 1.0, "working": 2.0, "approval": 1.6, "done": 1.3, "error": 1.8}
+    IDLE_CALM_MS = [2600, 320, 320, 420, 420, 900, 900]   # 首帧静止 2.6 秒再呼吸一轮
+
+    def __init__(self, on_toggle, on_move, on_press, store=None, cfg=None):
         super().__init__()
         self.store = store
+        cfg = cfg or {}
+        self.calm = bool(cfg.get("calm", True))
+        self.fps = int(cfg.get("fps", 12)) if self.calm else 30
         self.scale = (store.ui.get("scale") if store else None) or 1.4
         self.setFixedSize(self.px(), self.px())
         self.setCursor(Qt.PointingHandCursor)
@@ -538,7 +546,7 @@ class PetWidget(QWidget):
         self.sheet = QPixmap(sheet) if os.path.exists(sheet) else QPixmap()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
-        self._timer.start(33)  # ~30fps
+        self._timer.start(int(1000 / max(1, self.fps)))
 
     def px(self):
         return int(self.BASE * self.scale)
@@ -584,6 +592,11 @@ class PetWidget(QWidget):
 
     def _frame_rect(self):
         row, n, durs = self.SPRITE_STATES.get(self.state, self.SPRITE_STATES["idle"])
+        if self.calm:
+            if self.state == "idle":
+                durs = self.IDLE_CALM_MS
+            else:
+                durs = [d * self.CALM_SLOW.get(self.state, 1.5) for d in durs]
         elapsed = (time.monotonic() - self._state_since) * 1000.0
         total = sum(durs)
         t = elapsed % total
@@ -648,9 +661,10 @@ class PetWidget(QWidget):
 class SentinelWindow(QWidget):
     PANEL_WIDTH = 430
 
-    def __init__(self, agents, store):
+    def __init__(self, agents, store, cfg=None):
         super().__init__()
         self.store = store
+        self.cfg = cfg or {}
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._drag_offset = None
@@ -661,7 +675,8 @@ class SentinelWindow(QWidget):
         root.setSpacing(6)
 
         # 宠物（可缩放）
-        self.ball = PetWidget(self.toggle_expand, self._drag_to, self._drag_start, store)
+        self.ball = PetWidget(self.toggle_expand, self._drag_to, self._drag_start,
+                              store, self.cfg)
         ball_bar = QHBoxLayout()
         ball_bar.setContentsMargins(0, 0, 0, 0)
         ball_bar.addStretch(1)
@@ -803,8 +818,10 @@ class SentinelWindow(QWidget):
 
 
 def main():
+    global CONFIG
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        agents = json.load(f)["agents"]
+        CONFIG = json.load(f)
+    agents = CONFIG["agents"]
 
     store = StateStore(agents)
     stop_event = threading.Event()
@@ -814,7 +831,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    win = SentinelWindow(agents, store)
+    win = SentinelWindow(agents, store, CONFIG.get("pet", {}))
     win.show()
     code = app.exec()
     stop_event.set()
