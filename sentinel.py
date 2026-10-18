@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
@@ -187,8 +188,14 @@ class StateStore:
 # ---------------------------------------------------------------- HTTP 服务
 
 
+class UiBridge(QObject):
+    """HTTP 线程 -> Qt 主线程 的桥。"""
+    show_requested = Signal()
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     store: StateStore = None  # 由外部注入
+    bridge: "UiBridge" = None
 
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -203,6 +210,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/state"):
             self._send(200, self.store.snapshot())
         elif self.path.startswith("/api/ping"):
+            self._send(200, {"ok": True})
+        elif self.path.startswith("/api/show"):
+            # 已被双击唤醒：把已有窗口叫回前台，而不是再起一个实例
+            try:
+                if self.bridge is not None:
+                    self.bridge.show_requested.emit()
+            except Exception:
+                pass
             self._send(200, {"ok": True})
         else:
             self._send(404, {"error": "not found"})
@@ -1134,6 +1149,15 @@ class SentinelWindow(QWidget):
     def toggle_visible(self):
         self.setVisible(not self.isVisible())
 
+    def bring_to_front(self):
+        """双击快捷方式时，若已有实例则在运行，把窗口叫回前台。"""
+        try:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
     # ---- 刷新 ----
     def refresh(self):
         snap = self.store.snapshot()
@@ -1194,10 +1218,28 @@ def already_running():
             pass
 
 
+def launch_log(msg):
+    """pythonw.exe 下 sys.stdout 是 None，直接 print 会抛异常，这里安全落盘。"""
+    try:
+        with open(os.path.join(BASE_DIR, "sentinel-launch.log"), "a",
+                  encoding="utf-8") as f:
+            f.write("%s  [pid %d] %s\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), msg))
+    except Exception:
+        pass
+    try:
+        if sys.stdout is not None:
+            sys.stdout.write(msg + "\n")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def main():
     global CONFIG
+    launch_log("start, python=%s" % sys.executable)
     if already_running():
-        print("Agent 哨兵已在运行（端口 %d 已占用），本次不重复启动。" % PORT)
+        launch_log("already running on port %d, exit" % PORT)
         sys.exit(0)
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         CONFIG = json.load(f)
@@ -1216,6 +1258,9 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     win = SentinelWindow(agents, store, CONFIG.get("pet", {}))
+    bridge = UiBridge()
+    bridge.show_requested.connect(win.bring_to_front)
+    ApiHandler.bridge = bridge
     win.show()
     code = app.exec()
     stop_event.set()
@@ -1224,4 +1269,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        # pythonw.exe 没有控制台，启动失败时用户看不到任何提示。
+        # 这里把 traceback 落到项目目录的 sentinel-error.log 便于排查。
+        try:
+            with open(os.path.join(BASE_DIR, "sentinel-error.log"), "a",
+                      encoding="utf-8") as _f:
+                _f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "  python=" +
+                         sys.executable + "\n")
+                _f.write(traceback.format_exc() + "\n")
+        except Exception:
+            pass
+        raise

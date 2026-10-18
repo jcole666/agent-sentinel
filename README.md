@@ -34,8 +34,24 @@ python extract_fireball.py   # 从本机 Codex 提取 Fireball 图集（可选�
 python sentinel.py
 ```
 
-Windows 下双击 `启动哨兵.vbs` 可静默后台启动（可用环境变量 `SENTINEL_PYTHON` 指定 Python）。
-开机自启：把它复制到 `Win+R` → `shell:startup` 打开的文件夹。
+Windows 下双击 `启动哨兵.vbs` 可静默后台启动（`python make_launcher.py` 可重新生成）。
+
+### Windows 启动器说明（踩过的坑）
+
+- **路径解析不走环境变量**。`setx` 写入的变量，对已经运行的 `explorer.exe` 不可见，
+  所以双击快捷方式时 `%SENTINEL_HOME%` 根本没被展开，脚本会跑到 vbs 所在目录找
+  `sentinel.py`，找不到。现在改为优先读注册表 `HKCU\Environment\SENTINEL_HOME`，
+  再退回 vbs 同目录、最后硬编码项目路径。
+- **.vbs 必须存成 GBK/ANSI**。Windows Script Host 按 ANSI 读取脚本，UTF-8 写的中文
+  路径会变成乱码；纯 ASCII 又不方便写死中文路径。`make_launcher.py` 用 `encoding="gbk"`
+  输出。
+- **已经有一个实例在跑时双击**：不再起第二个进程，而是请求 `/api/show` 把已有窗口
+  叫回前台。
+- **`pythonw.exe` 没有控制台**，启动失败是完全静默的。启动器会在 6 秒后探测
+  `127.0.0.1:17890`，起不来才弹窗，并给出 `sentinel-launch.log` / `sentinel-error.log`
+  的位置。
+
+开机自启：把 `启动哨兵.vbs` 复制到 `Win+R` → `shell:startup` 打开的文件夹。
 
 ## 交互
 
