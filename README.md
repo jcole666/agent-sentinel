@@ -22,7 +22,7 @@
 |---|---|
 | Claude Code | hooks 自动上报（任务/工具/待审批/完成） |
 | Codex | **本地回合库监听**（实时，含任务标题）+ config.toml notify 兜底 |
-| DeepSeek Harness | **窗口标题监听**（一开工就显示任务名）+ 通用 POST 上报 |
+| DeepSeek Harness | **TCP 连接监听**（生成回复必有 API 长连接，空闲即不显示任务） |
 | WorkBuddy 国内版 / 国际版 | **本地 SQLite 会话表监听**（自动显示会话标题与状态） |
 | Claude Desktop | **本地会话 JSON + 回合记录监听**（实时，含会话标题） |
 
@@ -44,22 +44,42 @@ Windows 下双击 `启动哨兵.vbs` 可静默后台启动（可用环境变量 
 - **点宠物**：原地展开/收起面板（面板向左展开，宠物不动）；**按住拖动**：移动位置
 - 面板里：右键某一行手动标记，双击行=快捷完成，︿ 收回，— 隐藏到托盘
 
-## 窗口标题监听（给没有 hook 的 GUI 应用）
+## 网络连接监听（DeepSeek Harness）
 
-DeepSeek Harness 这类应用没有对外接口，但它的窗口标题会带当前会话/任务名
-（例如 `问候 — DeepSeek Harness`）。哨兵每 2 秒扫一次窗口标题：
+DeepSeek Harness 是纯云端应用：会话不落本地盘、没有 hook、窗口标题在对话结束后也不会变
+（所以标题/CPU 方案会错误地一直显示「工作中」）。
+
+但它的工作方式决定了：**流式生成回复期间，进程树必然持有一条到 API 端点（或本地代理）
+的 ESTABLISHED TCP 连接；空闲时只剩进程间 IPC**。哨兵每 3 秒扫一次它的 TCP 连接：
+
+- 出现外部连接（连续两轮确认，防抖）→ **工作中**，任务名取窗口标题里那段
+- 连接消失 → **已完成**（保留约 1 分钟缓冲），随后**回到空闲、不再显示任务**
+- 进程退出 → 清空
+
+进程间连接的识别：回环且远端端口属于本进程树的监听端口或任一本地端口 → 视为 IPC 排除。
+
+配置在 `config.json` 的 `watch_net`：
+
+```json
+"watch_net": { "process": "deepseek harness.exe", "title_suffix": "DeepSeek Harness", "done_seconds": 60 }
+```
+
+只读系统连接表，不解密、不抓包，只看连接是否存在。
+
+## 窗口标题监听（备用方案，给无网络特征的 GUI 应用）
+
+某些应用的窗口标题会带当前会话/任务名（例如 `问候 — DeepSeek Harness`）。哨兵每 2 秒扫一次窗口标题：
 
 - 标题带任务名 → 立刻显示为**工作中**，任务名就是标题里那段
 - 进程树持续 12 分钟无 CPU 活动 → 自动转为**已完成**（`idle_minutes` 可调）
 - 窗口关闭或标题回到纯应用名 → 清空
 
-配置在 `config.json` 的 `watch_window`：
-
 ```json
-"watch_window": { "process": "deepseek harness.exe", "title_suffix": "DeepSeek Harness", "idle_minutes": 12 }
+"watch_window": { "process": "xxx.exe", "title_suffix": "XXX", "idle_minutes": 12 }
 ```
 
-其它 GUI 应用同理，填上进程名和标题后缀即可（标题里没有任务名的应用无法用这招，仍是手动标记）。
+注意：标题在对话结束后通常不会变，所以这个方案无法区分「还在生成」和「挂着窗口没动」，
+只适合作为没有更好信号时的兜底。
 
 ## 本地回合库监听（Codex）
 

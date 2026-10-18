@@ -41,10 +41,10 @@
       "label": "DeepSeek Harness",
       "kind": "gui",
       "proc_match": { "name": "deepseek harness.exe", "path_contains": "deepseekharness" },
-      "watch_window": {
+      "watch_net": {
         "process": "deepseek harness.exe",
         "title_suffix": "DeepSeek Harness",
-        "idle_minutes": 12
+        "done_seconds": 60
       }
     },
     {

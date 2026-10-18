@@ -78,7 +78,18 @@ class StateStore:
                         if kk in v:
                             d[kk] = v[kk]
                     if isinstance(v.get("tasks"), dict):
-                        d["tasks"] = v["tasks"]
+                        # 只保留 30 分钟内的任务：换过监听方式后，旧 watcher 留下的
+                        # task_id 再也没人会去结束它，会一直挂着显示「工作中」
+                        now = time.time()
+                        d["tasks"] = {
+                            tid: tv for tid, tv in v["tasks"].items()
+                            if isinstance(tv, dict) and now - tv.get("updated", 0) < 1800
+                        }
+            # 清理完后重新汇总展示状态，避免已丢弃的旧任务残留「工作中」
+            for d in self.data.values():
+                d["state"] = self._aggregate(d["tasks"]) or "idle"
+                top = self._top_task(d["tasks"])
+                d["task"] = top["text"] if top else ""
         except Exception:
             pass
 
@@ -513,6 +524,94 @@ def run_json_watcher(store, agents, stop_event):
                 for gone in (seen.get(aid, set()) - cur):
                     store.report(aid, "idle", task_id=gone)
                 seen[aid] = cur
+        except Exception:
+            pass
+        stop_event.wait(3.0)
+
+
+def run_net_watcher(store, agents, stop_event):
+    """ 通过进程树的 TCP 连接判断「是否正在对话」（DeepSeek Harness 这类纯云端应用）。
+
+    原理：流式生成回复期间，应用必须持有一条到 API 端点（或本地代理）的
+    ESTABLISHED 连接；空闲时只剩进程间 IPC（连到自己监听端口的回环连接）。
+    所以：出现外部连接 = 对话进行中；连接消失 = 对话结束。
+    比窗口标题 / CPU 都准——标题对话结束后不变，CPU 会被界面定时刷新干扰。 """
+    watched = [(a["id"], a["watch_net"]) for a in agents if a.get("watch_net")]
+    if not watched:
+        return
+    streak = {}        # aid -> 连续检测到外部连接的次数（防抖）
+    last_active = {}   # aid -> 最后一次有外部连接的时间
+    TASK_ID = "net"
+
+    def is_loopback(ip):
+        return ip.startswith("127.") or ip == "::1"
+
+    while not stop_event.is_set():
+        try:
+            now = time.time()
+            wins = enum_windows()
+            for aid, cfg in watched:
+                pname = (cfg.get("process") or "").lower()
+                if not pname:
+                    continue
+                pids = [p.pid for p in psutil.process_iter(["name"])
+                        if (p.info["name"] or "").lower() == pname]
+                if not pids:
+                    streak.pop(aid, None)
+                    if aid in last_active:
+                        last_active.pop(aid, None)
+                        store.report(aid, "idle", task_id=TASK_ID)
+                    continue
+
+                conns = []
+                for pid in pids:
+                    try:
+                        conns += psutil.Process(pid).net_connections(kind="tcp")
+                    except Exception:
+                        continue
+                listen_ports = {c.laddr.port for c in conns
+                                if c.status == "LISTEN" and c.laddr}
+                # 本进程树所有连接的本地端口集合：同一条进程间连接会从两端各看到一次，
+                # 从主进程一侧看时远端端口是渲染进程的临时端口，必须也排除掉。
+                local_ports = {c.laddr.port for c in conns if c.laddr}
+                ext = any(
+                    c.status == "ESTABLISHED" and c.raddr and
+                    not (is_loopback(c.raddr.ip) and
+                         (c.raddr.port in listen_ports or c.raddr.port in local_ports))
+                    for c in conns)
+
+                if ext:
+                    streak[aid] = streak.get(aid, 0) + 1
+                    if streak[aid] >= 2:          # 连续两轮才算，过滤瞬时请求
+                        last_active[aid] = now
+                else:
+                    streak[aid] = 0
+
+                # 任务名仍取窗口标题（标题里没有任务名就用占位）
+                name = ""
+                suffix = cfg.get("title_suffix", "")
+                for _hwnd, title, pid in wins:
+                    if pid not in pids or (suffix and not title.endswith(suffix)):
+                        continue
+                    nm = title
+                    for sep in ("—", "-", "–"):
+                        if sep in title:
+                            nm = title.rsplit(sep, 1)[0].strip()
+                            break
+                    if nm and nm != suffix:
+                        name = nm
+                    break
+
+                done_sec = float(cfg.get("done_seconds", 60))
+                quiet = now - last_active.get(aid, 0)
+                if aid in last_active and quiet < done_sec:
+                    store.report(aid, "working", name or "对话中", task_id=TASK_ID)
+                elif aid in last_active and quiet < done_sec * 3:
+                    store.report(aid, "done", name or "对话", task_id=TASK_ID)
+                else:
+                    if aid in last_active:
+                        last_active.pop(aid, None)
+                    store.report(aid, "idle", task_id=TASK_ID)
         except Exception:
             pass
         stop_event.wait(3.0)
@@ -1112,6 +1211,7 @@ def main():
     threading.Thread(target=run_db_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_turn_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_json_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_net_watcher, args=(store, agents, stop_event), daemon=True).start()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
