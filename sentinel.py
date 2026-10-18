@@ -257,6 +257,69 @@ def enum_windows():
         return []
 
 
+def run_turn_watcher(store, agents, stop_event):
+    """ 读取 Codex 本地回合库（thread_history/state sqlite）：
+    thread_turns.status == inProgress 就是「正在干活」，实时性好于 notify。
+    只读，只取 thread_id/status/时间/标题。 """
+    watched = [(a["id"], a["watch_turns"]) for a in agents if a.get("watch_turns")]
+    if not watched:
+        return
+    import glob as _glob
+    import sqlite3
+    seen = {}
+
+    def latest(pattern):
+        hits = _glob.glob(os.path.expandvars(pattern))
+        return max(hits, key=os.path.getmtime) if hits else None
+
+    while not stop_event.is_set():
+        try:
+            now = time.time()
+            for aid, cfg in watched:
+                turns_db = latest(cfg.get("turns_db_glob", ""))
+                threads_db = latest(cfg.get("threads_db_glob", ""))
+                if not turns_db:
+                    continue
+                active_min = float(cfg.get("active_minutes", 10))
+                done_min = float(cfg.get("done_minutes", 3))
+                rows = []
+                con = sqlite3.connect(
+                    "file:" + turns_db.replace("\\", "/") + "?mode=ro", uri=True, timeout=1.0)
+                try:
+                    if threads_db:
+                        con.execute("ATTACH DATABASE 'file:%s?mode=ro' AS tdb"
+                                    % threads_db.replace("\\", "/"))
+                    rows = list(con.execute(
+                        "SELECT tt.thread_id, tt.status, tt.started_at, tt.completed_at, "
+                        "       COALESCE(t.title, '') "
+                        "FROM thread_turns tt "
+                        "LEFT JOIN tdb.threads t ON t.id = tt.thread_id "
+                        "ORDER BY tt.started_at DESC LIMIT 10"))
+                except sqlite3.Error:
+                    rows = []
+                finally:
+                    con.close()
+
+                cur = set()
+                for tid, status, started, completed, title in rows:
+                    if not title:
+                        continue
+                    task_id = "codex-" + str(tid)[:8]
+                    if status and status.lower().startswith("inprogress") \
+                            and started and now - started < active_min * 60:
+                        cur.add(task_id)
+                        store.report(aid, "working", str(title)[:60], task_id=task_id)
+                    elif completed and now - completed < done_min * 60:
+                        cur.add(task_id)
+                        store.report(aid, "done", str(title)[:60], task_id=task_id)
+                for gone in (seen.get(aid, set()) - cur):
+                    store.report(aid, "idle", task_id=gone)
+                seen[aid] = cur
+        except Exception:
+            pass
+        stop_event.wait(3.0)
+
+
 def run_db_watcher(store, agents, stop_event):
     """ 读取 GUI Agent 的本地 SQLite（如 WorkBuddy 的 sessions 表）：
     有正在进行的会话就显示其标题与状态，完全不依赖 Agent 自觉上报。
@@ -895,6 +958,7 @@ def main():
     threading.Thread(target=run_proc_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_window_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_db_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_turn_watcher, args=(store, agents, stop_event), daemon=True).start()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

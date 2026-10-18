@@ -20,7 +20,13 @@
       "id": "codex",
       "label": "Codex",
       "kind": "cli",
-      "proc_match": { "name": "codex.exe", "path_contains": "openai\\codex" }
+      "proc_match": { "name": "codex.exe", "path_contains": "openai\\codex" },
+      "watch_turns": {
+        "turns_db_glob": "%USERPROFILE%\\.codex\\thread_history_*.sqlite",
+        "threads_db_glob": "%USERPROFILE%\\.codex\\state_*.sqlite",
+        "active_minutes": 10,
+        "done_minutes": 3
+      }
     },
     {
       "id": "deepseek-harness",

@@ -21,7 +21,7 @@
 | Agent | 监控方式 |
 |---|---|
 | Claude Code | hooks 自动上报（任务/工具/待审批/完成） |
-| Codex | config.toml notify 自动上报 |
+| Codex | **本地回合库监听**（实时，含任务标题）+ config.toml notify 兜底 |
 | DeepSeek Harness | **窗口标题监听**（一开工就显示任务名）+ 通用 POST 上报 |
 | WorkBuddy 国内版 / 国际版 | **本地 SQLite 会话表监听**（自动显示会话标题与状态） |
 | Claude Desktop | 进程检测 + 手动标记（无对外接口、无本地会话表） |
@@ -60,6 +60,24 @@ DeepSeek Harness 这类应用没有对外接口，但它的窗口标题会带当
 ```
 
 其它 GUI 应用同理，填上进程名和标题后缀即可（标题里没有任务名的应用无法用这招，仍是手动标记）。
+
+## 本地回合库监听（Codex）
+
+Codex 桌面版把每个回合的实时状态写在本地 sqlite：`thread_history_*.sqlite` 的
+`thread_turns` 表（`status` = `inProgress` / `completed`），配合 `state_*.sqlite` 的
+`threads` 表拿会话标题。哨兵每 3 秒只读查询一次：
+
+- 有 `inProgress` 回合 → 立刻显示**工作中** + 会话标题（notify 只在回合结束时触发，做不到这点）
+- 回合刚完成（3 分钟内）→ 已完成
+- 超过 `active_minutes` 没动静 → 移除
+
+```json
+"watch_turns": { "turns_db_glob": "%USERPROFILE%\\.codex\\thread_history_*.sqlite",
+                 "threads_db_glob": "%USERPROFILE%\\.codex\\state_*.sqlite",
+                 "active_minutes": 10, "done_minutes": 3 }
+```
+
+只读打开，只取 id/状态/时间/标题，不读会话内容。
 
 ## 本地会话库监听（WorkBuddy）
 
