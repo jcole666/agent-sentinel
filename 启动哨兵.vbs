@@ -1,10 +1,16 @@
 ' Agent Sentinel - silent launcher
 ' IMPORTANT: keep this file pure ASCII. Windows Script Host reads .vbs as ANSI,
 ' so any non-ASCII character (Chinese comments etc.) makes the script fail silently.
+'
+' Project dir resolution order:
+'   1) user env var SENTINEL_HOME   (set for Desktop / Startup copies)
+'   2) the folder this .vbs sits in (works when the .vbs is next to sentinel.py)
 Dim fso, shell, dir, py, candidates, i
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
-dir = fso.GetParentFolderName(WScript.ScriptFullName)
+
+dir = shell.ExpandEnvironmentStrings("%SENTINEL_HOME%")
+If dir = "%SENTINEL_HOME%" Then dir = fso.GetParentFolderName(WScript.ScriptFullName)
 
 py = shell.ExpandEnvironmentStrings("%SENTINEL_PYTHON%")
 If py = "%SENTINEL_PYTHON%" Then py = ""
