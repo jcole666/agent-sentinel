@@ -1,0 +1,13 @@
+# 运行时状态（本机数据，不进仓库）
+state.json
+
+# 从 Codex 提取的素材（版权属 OpenAI，请用 extract_fireball.py 本地生成）
+fireball.png
+fireball.webp
+
+# 个人用图
+ball.png
+
+__pycache__/
+*.pyc
+_probe*

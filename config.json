@@ -1,0 +1,40 @@
+{
+  "agents": [
+    {
+      "id": "claude-code",
+      "label": "Claude Code",
+      "kind": "cli",
+      "proc_match": { "name": "", "path_contains": "claude-cli-nodejs" }
+    },
+    {
+      "id": "claude-desktop",
+      "label": "Claude Desktop",
+      "kind": "gui",
+      "proc_match": { "name": "claude.exe", "path_contains": "windowsapps\\claude_" }
+    },
+    {
+      "id": "codex",
+      "label": "Codex",
+      "kind": "cli",
+      "proc_match": { "name": "codex.exe", "path_contains": "openai\\codex" }
+    },
+    {
+      "id": "deepseek-harness",
+      "label": "DeepSeek Harness",
+      "kind": "gui",
+      "proc_match": { "name": "deepseek harness.exe", "path_contains": "deepseekharness" }
+    },
+    {
+      "id": "workbuddy-cn",
+      "label": "WorkBuddy 国内版",
+      "kind": "gui",
+      "proc_match": { "name": "workbuddy.exe", "path_contains": "" }
+    },
+    {
+      "id": "workbuddy-intl",
+      "label": "WorkBuddy 国际版",
+      "kind": "gui",
+      "proc_match": { "name": "workbuddyai.exe", "path_contains": "" }
+    }
+  ]
+}
