@@ -1180,16 +1180,37 @@ class GlassPanel(QWidget):
     def __init__(self):
         super().__init__()
         self._backdrop = QImage()
+        self._bg_alpha = 1.0          # 新背景淡入用，避免「唰一下换图」的跳变
+        self._bg_anim = QVariantAnimation(self)
+        self._bg_anim.setDuration(170)
+        self._bg_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._bg_anim.valueChanged.connect(self._on_bg_alpha)
         self.setAttribute(Qt.WA_TranslucentBackground)
+
+    def _on_bg_alpha(self, v):
+        self._bg_alpha = float(v)
+        self.update()
+
+    def clear_backdrop(self):
+        """ 尺寸要变了：先撤掉旧背景，免得按新尺寸拉伸出一张糊图 """
+        self._bg_anim.stop()
+        self._backdrop = QImage()
+        self._bg_alpha = 1.0
+        self.update()
 
     def finish_capture(self, img):
         """ 贴上抓到并模糊过的背景；img 为空则退化为纯色玻璃 """
         if img is None or img.isNull():
-            self._backdrop = QImage()
-            self.update()
+            if self._backdrop.isNull():
+                self._bg_alpha = 1.0
+                self.update()
             return
         self._backdrop = _blur_image(img)
-        self.update()
+        self._bg_alpha = 0.0
+        self._bg_anim.stop()
+        self._bg_anim.setStartValue(0.0)
+        self._bg_anim.setEndValue(1.0)
+        self._bg_anim.start()
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -1201,9 +1222,14 @@ class GlassPanel(QWidget):
         p.save()
         p.setClipPath(path)
         if not self._backdrop.isNull():
+            if self._bg_alpha < 0.995:
+                # 淡入过程中先铺一层底，否则背后的实景会从半透明里透出来，反而脏
+                p.fillRect(rect, QColor(246, 247, 250))
+            p.setOpacity(self._bg_alpha)
             p.drawImage(rect, self._backdrop)
+            p.setOpacity(1.0)
         else:
-            p.fillRect(rect, QColor(245, 246, 249))
+            p.fillRect(rect, QColor(246, 247, 250))
         # 白霜（玻璃的“乳白感”都在这层）
         g = QLinearGradient(0, rect.top(), 0, rect.bottom())
         g.setColorAt(0.0, QColor(255, 255, 255, 200))
@@ -1695,10 +1721,11 @@ class SentinelWindow(QWidget):
         self._drag_offset = None
         self._expanded = False
         self._bg_busy = False
+        self._excluded = False
         self._anchor_top = None      # 期望的窗口顶边（越界上移只是临时避让）
         self._bg_timer = QTimer(self)
         self._bg_timer.setSingleShot(True)
-        self._bg_timer.timeout.connect(lambda: self._snap_backdrop(40))
+        self._bg_timer.timeout.connect(lambda: self._snap_backdrop(0))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1791,54 +1818,93 @@ class SentinelWindow(QWidget):
         # 展开/收起时保持宠物位置不动：窗口右边缘固定，面板向左展开
         right_edge = self.geometry().right()
         top = self.geometry().top()
-        self.panel.setVisible(self._expanded)
         if self._expanded:
-            self.setFixedWidth(self.PANEL_WIDTH)
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
-            self.adjustSize()
+            # 尺寸一次算准：先让布局激活，再一次性 resize。
+            # 以前是 setVisible→setFixedWidth→adjustSize 连续三次改尺寸，
+            # Qt 每次都要重建 backing store，肉眼就是「闪一下」。
+            self.setUpdatesEnabled(False)
+            try:
+                self.panel.setVisible(True)
+                self.setFixedWidth(self.PANEL_WIDTH)
+                self.setMinimumHeight(0)
+                self.setMaximumHeight(16777215)
+                try:
+                    self.layout().activate()
+                except Exception:
+                    pass
+                self.resize(self.PANEL_WIDTH, self.sizeHint().height())
+            finally:
+                self.setUpdatesEnabled(True)
             if self.isVisible():
                 self._anchor_top = top
                 self.move(max(0, right_edge - self.width() + 1), top)
                 self._fit_on_screen()
+            self.repaint()
             # 布局是惰性的：展开瞬间拿到的 sizeHint 可能还差一次计算，
             # 稍后再校准一轮，然后再抓背景（保证抓的是最终尺寸）
-            QTimer.singleShot(40, self._expand_settle)
-            QTimer.singleShot(140, lambda: self._snap_backdrop(60))
+            QTimer.singleShot(30, self._expand_settle)
+            QTimer.singleShot(90, lambda: self._snap_backdrop(0))
         else:
-            self.setFixedSize(self.ball.px(), self.ball.px())
+            self.setUpdatesEnabled(False)
+            try:
+                self.panel.setVisible(False)
+                self.setFixedSize(self.ball.px(), self.ball.px())
+            finally:
+                self.setUpdatesEnabled(True)
             if self.isVisible():
                 self.move(max(0, right_edge - self.ball.px() + 1), top)
+            self.repaint()
 
     # ---- 玻璃背景：抓窗口背后的桌面，模糊后贴到面板底层 ----
-    def _snap_backdrop(self, delay=90):
-        """ 把面板与宠物临时藏起来（尺寸先锁死，免得布局回缩导致窗口跳动），
-            抓拍背后的桌面，再原样显形。不 hide() 整个窗口，避免被系统挪位置。 """
+    def _snap_backdrop(self, delay=60):
+        """ 抓一次窗口背后的桌面。
+
+            关键：**不要把窗口藏起来**。以前是 hide() → 等一帧 → 抓 → show()，
+            这一藏一闪在用户眼里就是「点一下屏幕抖一下」。
+            改用 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) 让系统在抓图
+            这几毫秒里把本窗口从捕获中排除：既拍不到自己，用户也看不出变化。 """
         if not self._expanded or not self.isVisible() or self._bg_busy:
             return
         self._bg_busy = True
-        self._bg_geo = QRect(self.geometry())
-        self._bg_panel_geo = QRect(self.panel.geometry())
-        self.setFixedHeight(self.height())        # 锁尺寸
-        self.panel.hide()
-        self.ball.hide()
-        QTimer.singleShot(delay, self._grab_backdrop)
+        self._grab_geo = QRect(self.geometry())
+        self._grab_panel_geo = QRect(self.panel.geometry())
+        QTimer.singleShot(delay, self._begin_capture)
 
-    def _grab_backdrop(self):
-        img = QImage()
-        geo, pg = self._bg_geo, self._bg_panel_geo
+    def _set_capture_excluded(self, on):
+        """ 把本窗口从屏幕捕获里排除（Win10 2004+）；不支持则返回 False """
         try:
+            import ctypes
+            from ctypes import wintypes
+            self._user32 = ctypes.windll.user32
+            hwnd = wintypes.HWND(int(self.winId()))
+            ok = self._user32.SetWindowDisplayAffinity(
+                hwnd, wintypes.DWORD(0x11 if on else 0x0))
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _begin_capture(self):
+        self._excluded = self._set_capture_excluded(True)
+        # 让 DWM 应用排除状态；窗口本身一直可见，所以这段等待不会闪
+        QTimer.singleShot(45 if self._excluded else 0, self._do_capture)
+
+    def _do_capture(self):
+        img = QImage()
+        try:
+            geo, pg = self._grab_geo, self._grab_panel_geo
             pm = self.screen().grabWindow(0, geo.x() + pg.x(), geo.y() + pg.y(),
                                           pg.width(), pg.height())
             if pm is not None and not pm.isNull():
                 img = pm.toImage()
         except Exception:
             pass
-        self.panel.show()
-        self.ball.show()
-        self.setMinimumHeight(0)
-        self.setMaximumHeight(16777215)
+        finally:
+            if getattr(self, "_excluded", False):
+                self._set_capture_excluded(False)
+                self._excluded = False
         self.panel.finish_capture(img)
+        launch_log("backdrop %dx%d -> panel %dx%d" % (
+            img.width(), img.height(), self.panel.width(), self.panel.height()))
         self._fit_on_screen()
         self._bg_busy = False
 
@@ -1905,6 +1971,7 @@ class SentinelWindow(QWidget):
             return
         self._refit()
         self._fit_on_screen()
+        self.update()
 
     def _refit(self):
         """ 任务增减导致卡片变高/变矮时，窗口跟着走 """
@@ -1924,7 +1991,7 @@ class SentinelWindow(QWidget):
         self._fit_on_screen()
         if self.geometry().topLeft() != before.topLeft():
             # 被屏幕边界顶上去了 → 玻璃里那张背景已经对不上，重新抓一次
-            self._bg_timer.start(320)
+            self._bg_timer.start(260)
 
     # ---- 拖动（面板模式下拖窗口空白处；宠物形态由 PetWidget 回调） ----
     def _drag_start(self, global_pos):
@@ -1951,7 +2018,7 @@ class SentinelWindow(QWidget):
         # 挪过位置后背景就变了，延迟重抓一次（晚一点抓，拖完的瞬间别闪）
         if self._expanded:
             self._fit_on_screen()
-            QTimer.singleShot(280, lambda: self._snap_backdrop(50))
+            QTimer.singleShot(220, lambda: self._snap_backdrop(0))
 
 
 # ---------------------------------------------------------------- 入口
