@@ -10,6 +10,7 @@ Agent 哨兵 (Agent Sentinel)
 
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -21,8 +22,14 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QColor, QCursor, QPainter, QPainterPath, QPixmap
+from PySide6.QtCore import (
+    QEasingCurve, QObject, QPointF, QRect, QRectF, Qt, QTimer,
+    QVariantAnimation, Signal,
+)
+from PySide6.QtGui import (
+    QBrush, QColor, QCursor, QFont, QFontMetrics, QImage, QLinearGradient,
+    QPainter, QPainterPath, QPen, QPixmap, QRadialGradient,
+)
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QMenu, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QStyle,
@@ -193,6 +200,7 @@ class StateStore:
 class UiBridge(QObject):
     """HTTP 线程 -> Qt 主线程 的桥。"""
     show_requested = Signal()
+    toggle_requested = Signal()
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -218,6 +226,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 if self.bridge is not None:
                     self.bridge.show_requested.emit()
+            except Exception:
+                pass
+            self._send(200, {"ok": True})
+        elif self.path.startswith("/api/toggle"):
+            # 远程/脚本 展开收起面板（调试与二次开发用）
+            try:
+                if self.bridge is not None:
+                    self.bridge.toggle_requested.emit()
             except Exception:
                 pass
             self._send(200, {"ok": True})
@@ -1124,91 +1140,356 @@ def rel_time(ts):
     return f"{secs // 3600}小时前"
 
 
+# ---- 液态玻璃：自己抓背景做模糊，形状/透明度完全可控 ----
+
+GLASS_RADIUS = 18
+CARD_RADIUS = 12
+
+
+def _oneline(text, limit=120):
+    """ 多行/带空白的原始文本 → 单行展示，避免画到卡片外 """
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    return t[:limit]
+
+
+def _rrect(rect, radius):
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+    return path
+
+
+def _blur_image(img, factor=14):
+    """ 降采样再逐级放大 = 廉价但足够柔和的高斯近似模糊 """
+    if img is None or img.isNull():
+        return QImage()
+    w, h = img.width(), img.height()
+    if w < 4 or h < 4:
+        return img
+    cur = img
+    while cur.width() > max(12, w // factor) and cur.width() > 12:
+        cur = cur.scaled(max(12, cur.width() // 2), max(12, cur.height() // 2),
+                         Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    return cur.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+
+class GlassPanel(QWidget):
+    """ 磨砂玻璃面板：把窗口背后的桌面抓一次、模糊后贴到底层，
+        再叠一层白霜 + 顶高光 + 细描边。比 Win11 原生亚克力好在
+        可以只作用于圆角形状内，不会把宠物区域糊成方块。 """
+
+    def __init__(self):
+        super().__init__()
+        self._backdrop = QImage()
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+    def finish_capture(self, img):
+        """ 贴上抓到并模糊过的背景；img 为空则退化为纯色玻璃 """
+        if img is None or img.isNull():
+            self._backdrop = QImage()
+            self.update()
+            return
+        self._backdrop = _blur_image(img)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = _rrect(rect, GLASS_RADIUS)
+
+        p.save()
+        p.setClipPath(path)
+        if not self._backdrop.isNull():
+            p.drawImage(rect, self._backdrop)
+        else:
+            p.fillRect(rect, QColor(245, 246, 249))
+        # 白霜（玻璃的“乳白感”都在这层）
+        g = QLinearGradient(0, rect.top(), 0, rect.bottom())
+        g.setColorAt(0.0, QColor(255, 255, 255, 200))
+        g.setColorAt(0.55, QColor(250, 252, 255, 188))
+        g.setColorAt(1.0, QColor(240, 244, 250, 178))
+        p.fillPath(path, QBrush(g))
+        # 左上角柔光，制造曲面反光
+        rad = QRadialGradient(QPointF(rect.left() + rect.width() * 0.18,
+                                      rect.top() - rect.height() * 0.15),
+                              rect.width() * 0.9)
+        rad.setColorAt(0.0, QColor(255, 255, 255, 130))
+        rad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, QBrush(rad))
+        p.restore()
+
+        # 内阴影（底部更重，模拟玻璃厚度）
+        inner = _rrect(rect.adjusted(1.5, 1.5, -1.5, -1.5), GLASS_RADIUS - 1.5)
+        ig = QLinearGradient(0, rect.top(), 0, rect.bottom())
+        ig.setColorAt(0.0, QColor(15, 23, 42, 0))
+        ig.setColorAt(0.72, QColor(15, 23, 42, 0))
+        ig.setColorAt(1.0, QColor(15, 23, 42, 26))
+        p.setPen(QPen(QBrush(ig), 2.0))
+        p.drawPath(inner)
+        # 内高光 + 外描边
+        p.setPen(QPen(QColor(255, 255, 255, 225), 1))
+        p.drawPath(_rrect(rect.adjusted(0.5, 0.5, -0.5, -0.5),
+                          GLASS_RADIUS - 0.5))
+        p.setPen(QPen(QColor(15, 23, 42, 30), 1))
+        p.drawPath(path)
+
+
 class AgentRow(QWidget):
-    """ 一个 Agent 一行；若它有多个任务，额外任务以缩进行展示 """
+    """ 一个 Agent 一张液态玻璃卡片；有多个任务时卡片自动变高 """
+
+    PAD_X = 13
+    LINE1 = 20          # 首行（名字/状态）基线区高度
+    LINE2 = 14          # 次行（任务描述）高度
+    SUB_H = 14          # 每条额外任务
+    PAD_T, PAD_B = 4, 5
 
     def __init__(self, agent, store):
         super().__init__()
         self.agent = agent
         self.store = store
         self.setCursor(Qt.PointingHandCursor)
-        self.vbox = QVBoxLayout(self)
-        self.vbox.setContentsMargins(0, 0, 0, 0)
-        self.vbox.setSpacing(0)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self._hover = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(160)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
 
-        head = QWidget()
-        lay = QHBoxLayout(head)
-        lay.setContentsMargins(10, 4, 10, 4)
-        lay.setSpacing(8)
-        self.dot = QLabel("●")
-        self.dot.setFixedWidth(14)
-        self.name = QLabel(agent["label"])
-        self.name.setFixedWidth(118)
-        self.name.setStyleSheet("font-weight:600; color:#1f2937;")
-        self.state_lbl = QLabel("空闲")
-        self.state_lbl.setFixedWidth(52)
-        self.task = QLabel("—")
-        self.task.setStyleSheet("color:#6b7280;")
-        lay.addWidget(self.dot)
-        lay.addWidget(self.name)
-        lay.addWidget(self.state_lbl)
-        lay.addWidget(self.task, 1)
-        self.vbox.addWidget(head)
+        self._state = "idle"
+        self._task_text = "—"
+        self._subs = []
+        self._pulse = 0.0
+        self._mouse = None
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.timeout.connect(self._on_pulse)
+        self._relayout()
 
-        self.sub_box = QVBoxLayout()
-        self.sub_box.setContentsMargins(34, 0, 10, 4)
-        self.sub_box.setSpacing(1)
-        self.vbox.addLayout(self.sub_box)
-        self._sub_labels = []
+    # ---- 尺寸 / 动画 ----
+    def _calc_height(self):
+        return (self.PAD_T + self.LINE1 + self.LINE2
+                + len(self._subs) * self.SUB_H + self.PAD_B)
 
-    def _set_subs(self, items):
-        """ items: [(state, text, ts)] """
-        while len(self._sub_labels) < len(items):
-            lb = QLabel()
-            lb.setStyleSheet("color:#9ca3af; font-size:11px;")
-            self._sub_labels.append(lb)
-            self.sub_box.addWidget(lb)
-        for i, lb in enumerate(self._sub_labels):
-            if i < len(items):
-                st, text, ts = items[i]
-                color = STATE_META.get(st, STATE_META["idle"])["color"]
-                lb.setText(f'<span style="color:{color}">●</span> {text}'
-                           + (f' · {rel_time(ts)}' if ts else ''))
-                lb.show()
-            else:
-                lb.hide()
+    def _relayout(self):
+        h = self._calc_height()
+        if self.height() != h:
+            self.setFixedHeight(h)
 
+    def _on_anim(self, v):
+        self._hover = float(v)
+        self.update()
+
+    def _on_pulse(self):
+        self._pulse = (self._pulse + 0.09) % 1.0
+        # 只重画左侧状态点所在的一小片
+        self.update(QRect(0, 0, 60, self.height()))
+
+    def mouseMoveEvent(self, e):
+        self._mouse = e.position()
+        if self._hover > 0.01:
+            self.update()
+
+    def enterEvent(self, e):
+        self._mouse = e.position()
+        self._start_anim(1.0)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._start_anim(0.0)
+        super().leaveEvent(e)
+
+    def _start_anim(self, target):
+        self._anim.stop()
+        self._anim.setStartValue(self._hover)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    # ---- 数据 ----
     def refresh(self, d):
         tasks = d.get("tasks") or {}
         st = d["state"]
-        meta = STATE_META[st]
-        color = meta["color"]
-        self.dot.setStyleSheet(f"color:{color}; font-size:13px;")
-        self.state_lbl.setText(meta["label"])
-        weight = "600" if st == "approval" else "400"
-        self.state_lbl.setStyleSheet(f"color:{color}; font-weight:{weight};")
-
+        self._state = st
         top = StateStore._top_task(tasks)
         parts = []
         if not d["proc_running"] and d["kind"] == "gui":
             parts.append("未运行")
         if top and top.get("text"):
-            parts.append(top["text"])
+            parts.append(_oneline(top["text"]))
         elif d.get("task"):
-            parts.append(d["task"])
+            parts.append(_oneline(d["task"]))
         if len(tasks) > 1:
             parts.append(f"共 {len(tasks)} 个任务")
         if d.get("updated"):
             parts.append(rel_time(d["updated"]))
-        self.task.setText(" · ".join(parts) if parts else "—")
+        self._task_text = " · ".join(parts) if parts else "—"
 
-        # 其余任务展开为缩进行（最多再展示 3 条）
         rest = [t for t in tasks.values() if t is not top]
         rest.sort(key=lambda x: (AGGREGATE_ORDER.index(x.get("state", "idle"))
                                  if x.get("state") in AGGREGATE_ORDER else 99,
                                  -x.get("updated", 0)))
-        self._set_subs([(t.get("state", "idle"), t.get("text", "")[:60], t.get("updated", 0))
-                        for t in rest[:3]])
+        self._subs = [(t.get("state", "idle"), _oneline(t.get("text", ""), 60),
+                       t.get("updated", 0)) for t in rest[:3]]
+
+        # 只有“活着”的状态才呼吸，避免整屏乱动
+        if st in ("working", "approval") and not self._pulse_timer.isActive():
+            self._pulse_timer.start(90)
+        elif st not in ("working", "approval") and self._pulse_timer.isActive():
+            self._pulse_timer.stop()
+            self._pulse = 0.0
+        self._mouse = None
+
+        self._relayout()
+        self.update()
+
+    # ---- 绘制 ----
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        hv = self._hover
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = _rrect(rect, CARD_RADIUS)
+
+        # 玻璃底板：静止时是薄薄一层霜，悬停时整片浮起
+        a = int(60 + 112 * hv)
+        g = QLinearGradient(0, rect.top(), 0, rect.bottom())
+        g.setColorAt(0.0, QColor(255, 255, 255, min(255, a + 26)))
+        g.setColorAt(0.55, QColor(252, 253, 255, a))
+        g.setColorAt(1.0, QColor(232, 239, 250, max(0, a - 16)))
+        p.fillPath(path, QBrush(g))
+
+        if hv > 0.02:
+            # 外发光：像被一盏柔光罩住
+            for pad, alpha in ((3.0, 10), (2.0, 16), (1.2, 24)):
+                gc = QColor(255, 255, 255, int(alpha * hv))
+                p.setPen(QPen(gc, 1.2))
+                p.drawPath(_rrect(rect.adjusted(-pad, -pad + 1, pad, pad + 1),
+                                  CARD_RADIUS + pad))
+            # 冷色细边：浅色底上也能一眼看出是哪一条被指着
+            p.setPen(QPen(QColor(70, 90, 120, int(38 * hv)), 1.0))
+            p.drawPath(_rrect(rect.adjusted(-0.5, -0.5, 0.5, 0.5),
+                              CARD_RADIUS + 0.5))
+        # 跟随鼠标的柔光：玻璃被手电筒照到的那一小片
+        if hv > 0.02 and self._mouse is not None:
+            p.save()
+            p.setClipPath(path)
+            rad2 = QRadialGradient(QPointF(self._mouse), 120)
+            rad2.setColorAt(0.0, QColor(255, 255, 255, int(96 * hv)))
+            rad2.setColorAt(0.55, QColor(255, 255, 255, int(34 * hv)))
+            rad2.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.fillPath(path, QBrush(rad2))
+            p.restore()
+
+        # 外侧细阴影（贴着卡片下沿，做出离地感）
+        p.setPen(QPen(QColor(15, 23, 42, int(8 + 16 * hv)), 1.0))
+        p.drawPath(_rrect(rect.adjusted(0.6, 1.6, -0.6, 0.6), CARD_RADIUS))
+        # 描边：外圈冷色发丝 + 内圈白高光，白底/深底都能看出边界
+        p.setPen(QPen(QColor(70, 90, 120, int(20 + 24 * hv)), 1.0))
+        p.drawPath(_rrect(rect.adjusted(-0.5, -0.5, 0.5, 0.5),
+                          CARD_RADIUS + 0.5))
+        p.setPen(QPen(QColor(255, 255, 255, int(150 + 90 * hv)), 1.0))
+        p.drawPath(path)
+        # 顶部一道高光，底部一道内阴影 = 玻璃厚度
+        p.setPen(QPen(QColor(255, 255, 255, int(120 + 90 * hv)), 1.0))
+        p.drawPath(_rrect(QRectF(rect.left() + 1, rect.top() + 0.5,
+                                 rect.width() - 2, rect.height() / 2),
+                          CARD_RADIUS - 1))
+        if hv > 0.02:
+            p.setPen(QPen(QColor(15, 23, 42, int(16 * hv)), 1.0))
+            p.drawPath(_rrect(rect.adjusted(0.5, 1.5, -0.5, -0.5),
+                              CARD_RADIUS))
+
+        meta = STATE_META.get(self._state, STATE_META["idle"])
+        color = QColor(meta["color"])
+        x = self.PAD_X
+        cy = self.PAD_T + self.LINE1 / 2
+
+        # 状态点：工作中/待审批带一圈呼吸光晕
+        dot = QPointF(x + 3.5, cy)
+        if self._state in ("working", "approval"):
+            phase = 0.5 + 0.5 * math.sin(self._pulse * math.tau)
+            halo = QRadialGradient(dot, 11)
+            hc = QColor(color)
+            hc.setAlpha(int(52 + 46 * phase))
+            halo.setColorAt(0.0, hc)
+            hc2 = QColor(color)
+            hc2.setAlpha(0)
+            halo.setColorAt(1.0, hc2)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(halo))
+            p.drawEllipse(dot, 11, 11)
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(dot, 3.6, 3.6)
+
+        # 名字
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setBold(True)
+        p.setFont(f)
+        dim = self._state == "idle"
+        p.setPen(QColor("#5f6876") if dim else QColor("#14181f"))
+        name_x = x + 15
+        fm = QFontMetrics(f)
+        name_max = self.width() - name_x - 92
+        p.drawText(QRect(name_x, self.PAD_T, name_max, self.LINE1),
+                   Qt.AlignVCenter | Qt.AlignLeft,
+                   fm.elidedText(self.agent["label"], Qt.ElideRight, name_max))
+
+        # 状态胶囊（右对齐）
+        sf = QFont(f)
+        sf.setPixelSize(10)
+        sf.setBold(self._state in ("working", "approval"))
+        sfm = QFontMetrics(sf)
+        label = meta["label"]
+        tw = sfm.horizontalAdvance(label)
+        pill_w = tw + 14
+        pill_h = 17
+        pill = QRectF(self.width() - self.PAD_X - pill_w,
+                      cy - pill_h / 2, pill_w, pill_h)
+        pill_bg = QColor(color)
+        pill_bg.setAlpha(40 if self._state != "idle" else 18)
+        p.setPen(Qt.NoPen)
+        p.setBrush(pill_bg)
+        p.drawRoundedRect(pill, pill_h / 2, pill_h / 2)
+        p.setFont(sf)
+        p.setPen(color if self._state != "idle" else QColor("#8d95a3"))
+        p.drawText(pill, Qt.AlignCenter, label)
+
+        # 任务描述（第二行）
+        tf = QFont(f)
+        tf.setPixelSize(11)
+        tf.setBold(False)
+        p.setFont(tf)
+        tcol = QColor("#5d6673") if not dim else QColor("#9aa1ac")
+        if hv > 0.02:
+            tcol = QColor("#3d4653") if not dim else QColor("#848b97")
+        p.setPen(tcol)
+        tfm = QFontMetrics(tf)
+        tmax = self.width() - self.PAD_X * 2 - 14
+        p.drawText(QRect(name_x, self.PAD_T + self.LINE1 - 4, tmax, self.LINE2),
+                   Qt.AlignVCenter | Qt.AlignLeft,
+                   tfm.elidedText(self._task_text, Qt.ElideRight, tmax))
+
+        # 额外任务
+        if self._subs:
+            sfont = QFont(tf)
+            sfont.setPixelSize(10)
+            p.setFont(sfont)
+            sfm2 = QFontMetrics(sfont)
+            y = self.PAD_T + self.LINE1 + self.LINE2 - 4
+            for st, text, ts in self._subs:
+                sc = QColor(STATE_META.get(st, STATE_META["idle"])["color"])
+                p.setPen(sc)
+                p.drawText(QRect(name_x, y, 8, self.SUB_H),
+                           Qt.AlignVCenter | Qt.AlignLeft, "•")
+                p.setPen(QColor("#8b929e"))
+                line = text + (f" · {rel_time(ts)}" if ts else "")
+                p.drawText(QRect(name_x + 9, y, tmax - 9, self.SUB_H),
+                           Qt.AlignVCenter | Qt.AlignLeft,
+                           sfm2.elidedText(line, Qt.ElideRight, tmax - 9))
+                y += self.SUB_H
 
     def mousePressEvent(self, e):
         if e.button() == Qt.RightButton:
@@ -1223,7 +1504,6 @@ class AgentRow(QWidget):
     def mouseDoubleClickEvent(self, e):
         # 双击快捷标记完成
         self.store.report(self.agent["id"], "done")
-
 
 def manual_task(state):
     return {"working": "手动标记", "approval": "手动标记",
@@ -1397,10 +1677,14 @@ class PetWidget(QWidget):
             self._press_pos = None
             if abs(delta.x()) < 6 and abs(delta.y()) < 6:
                 self._on_toggle()  # 视为点击而非拖动
+            else:
+                w = self.window()
+                if hasattr(w, "_after_drag"):
+                    w._after_drag()
 
 
 class SentinelWindow(QWidget):
-    PANEL_WIDTH = 430
+    PANEL_WIDTH = 404
 
     def __init__(self, agents, store, cfg=None):
         super().__init__()
@@ -1410,6 +1694,7 @@ class SentinelWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._drag_offset = None
         self._expanded = False
+        self._bg_busy = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1424,34 +1709,35 @@ class SentinelWindow(QWidget):
         ball_bar.addWidget(self.ball)
         root.addLayout(ball_bar)
 
-        # 展开面板
-        self.panel = QWidget()
-        self.panel.setObjectName("panel")
-        self.panel.setStyleSheet(
-            "#panel { background: rgba(255,255,255,250); border: 1px solid #e5e7eb;"
-            " border-radius: 10px; }")
+        # 展开面板（液态玻璃）
+        self.panel = GlassPanel()
         root.addWidget(self.panel)
         lay = QVBoxLayout(self.panel)
-        lay.setContentsMargins(4, 6, 4, 8)
-        lay.setSpacing(2)
+        lay.setContentsMargins(9, 7, 9, 7)
+        lay.setSpacing(5)
 
         # 标题栏
         bar = QHBoxLayout()
-        bar.setContentsMargins(12, 2, 8, 0)
+        bar.setContentsMargins(6, 0, 2, 0)
         title = QLabel("Agent 哨兵")
-        title.setStyleSheet("font-weight:600; color:#111827; letter-spacing:1px;")
+        title.setStyleSheet("font-weight:600; color:#0f1319; letter-spacing:2px;"
+                            " font-size:12px; background:transparent;")
         bar.addWidget(title)
         bar.addStretch(1)
         btn_collapse = QPushButton("︿")
-        btn_collapse.setFixedSize(24, 24)
+        btn_collapse.setFixedSize(24, 22)
         btn_collapse.setToolTip("收回小球")
         btn_collapse.clicked.connect(self.toggle_expand)
         btn_hide = QPushButton("—")
-        btn_hide.setFixedSize(24, 24)
+        btn_hide.setFixedSize(24, 22)
         btn_hide.setToolTip("隐藏到托盘")
         btn_hide.clicked.connect(self.hide)
         for b in (btn_collapse, btn_hide):
-            b.setStyleSheet("QPushButton{border:none;color:#9ca3af;} QPushButton:hover{color:#111827;}")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                "QPushButton{border:none; background:transparent; color:#8b93a0;"
+                " font-size:12px; border-radius:7px;}"
+                "QPushButton:hover{background:rgba(255,255,255,150); color:#14181f;}")
             bar.addWidget(b)
         lay.addLayout(bar)
 
@@ -1462,7 +1748,8 @@ class SentinelWindow(QWidget):
             self.rows.append((a["id"], row))
 
         foot = QLabel("右键行=标记 · 双击行=完成 · 滚轮/右键宠物=调大小")
-        foot.setStyleSheet("color:#c4c9d1; font-size:10px; padding:2px 12px;")
+        foot.setStyleSheet("color:rgba(96,105,120,195); font-size:10px;"
+                           " padding:1px 6px 0 6px; background:transparent;")
         lay.addWidget(foot)
 
         # 托盘
@@ -1506,11 +1793,55 @@ class SentinelWindow(QWidget):
             self.setMaximumHeight(16777215)
             self.adjustSize()
             if self.isVisible():
-                self.move(max(0, right_edge - self.width() + 1), top)
+                y = top
+                avail = self.screen().availableGeometry()
+                overflow = (y + self.height()) - (avail.bottom() - 4)
+                if overflow > 0:
+                    y = max(avail.top(), y - overflow)
+                self.move(max(0, right_edge - self.width() + 1), y)
+            self._snap_backdrop(90)
         else:
             self.setFixedSize(self.ball.px(), self.ball.px())
             if self.isVisible():
                 self.move(max(0, right_edge - self.ball.px() + 1), top)
+
+    # ---- 玻璃背景：抓窗口背后的桌面，模糊后贴到面板底层 ----
+    def _snap_backdrop(self, delay=90):
+        """ 把面板与宠物临时藏起来（尺寸先锁死，免得布局回缩导致窗口跳动），
+            抓拍背后的桌面，再原样显形。不 hide() 整个窗口，避免被系统挪位置。 """
+        if not self._expanded or not self.isVisible() or self._bg_busy:
+            return
+        self._bg_busy = True
+        self._bg_geo = QRect(self.geometry())
+        self._bg_panel_geo = QRect(self.panel.geometry())
+        self.setFixedHeight(self.height())        # 锁尺寸
+        self.panel.hide()
+        self.ball.hide()
+        QTimer.singleShot(delay, self._grab_backdrop)
+
+    def _grab_backdrop(self):
+        img = QImage()
+        geo, pg = self._bg_geo, self._bg_panel_geo
+        try:
+            pm = self.screen().grabWindow(0, geo.x() + pg.x(), geo.y() + pg.y(),
+                                          pg.width(), pg.height())
+            if pm is not None and not pm.isNull():
+                img = pm.toImage()
+        except Exception:
+            pass
+        self.panel.show()
+        self.ball.show()
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+        if self.geometry().topLeft() != geo.topLeft():
+            self.move(geo.topLeft())
+        self.panel.finish_capture(img)
+        self._bg_busy = False
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._expanded and not self._bg_busy:
+            self._snap_backdrop(120)
 
     def toggle_visible(self):
         self.setVisible(not self.isVisible())
@@ -1543,6 +1874,17 @@ class SentinelWindow(QWidget):
                 if d["state"] == s and AGGREGATE_ORDER.index(s) < AGGREGATE_ORDER.index(top_state):
                     top_state = s
         self.ball.set_status(top_state, active)
+        self._refit()
+
+    def _refit(self):
+        """ 任务增减导致卡片变高/变矮时，窗口跟着走 """
+        if not self._expanded:
+            return
+        need = self.sizeHint().height()
+        if abs(need - self.height()) > 1:
+            right = self.geometry().right()
+            self.resize(self.PANEL_WIDTH, need)
+            self.move(right - self.PANEL_WIDTH + 1, self.y())
 
     # ---- 拖动（面板模式下拖窗口空白处；宠物形态由 PetWidget 回调） ----
     def _drag_start(self, global_pos):
@@ -1562,6 +1904,12 @@ class SentinelWindow(QWidget):
 
     def mouseReleaseEvent(self, e):
         self._drag_offset = None
+        self._after_drag()
+
+    def _after_drag(self):
+        # 挪过位置后背景就变了，延迟重抓一次（晚一点抓，拖完的瞬间别闪）
+        if self._expanded:
+            QTimer.singleShot(280, lambda: self._snap_backdrop(50))
 
 
 # ---------------------------------------------------------------- 入口
@@ -1628,6 +1976,7 @@ def main():
     win = SentinelWindow(agents, store, CONFIG.get("pet", {}))
     bridge = UiBridge()
     bridge.show_requested.connect(win.bring_to_front)
+    bridge.toggle_requested.connect(win.toggle_expand)
     ApiHandler.bridge = bridge
     win.show()
     code = app.exec()
