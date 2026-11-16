@@ -1695,6 +1695,10 @@ class SentinelWindow(QWidget):
         self._drag_offset = None
         self._expanded = False
         self._bg_busy = False
+        self._anchor_top = None      # 期望的窗口顶边（越界上移只是临时避让）
+        self._bg_timer = QTimer(self)
+        self._bg_timer.setSingleShot(True)
+        self._bg_timer.timeout.connect(lambda: self._snap_backdrop(40))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1790,16 +1794,17 @@ class SentinelWindow(QWidget):
         self.panel.setVisible(self._expanded)
         if self._expanded:
             self.setFixedWidth(self.PANEL_WIDTH)
+            self.setMinimumHeight(0)
             self.setMaximumHeight(16777215)
             self.adjustSize()
             if self.isVisible():
-                y = top
-                avail = self.screen().availableGeometry()
-                overflow = (y + self.height()) - (avail.bottom() - 4)
-                if overflow > 0:
-                    y = max(avail.top(), y - overflow)
-                self.move(max(0, right_edge - self.width() + 1), y)
-            self._snap_backdrop(90)
+                self._anchor_top = top
+                self.move(max(0, right_edge - self.width() + 1), top)
+                self._fit_on_screen()
+            # 布局是惰性的：展开瞬间拿到的 sizeHint 可能还差一次计算，
+            # 稍后再校准一轮，然后再抓背景（保证抓的是最终尺寸）
+            QTimer.singleShot(40, self._expand_settle)
+            QTimer.singleShot(140, lambda: self._snap_backdrop(60))
         else:
             self.setFixedSize(self.ball.px(), self.ball.px())
             if self.isVisible():
@@ -1833,9 +1838,8 @@ class SentinelWindow(QWidget):
         self.ball.show()
         self.setMinimumHeight(0)
         self.setMaximumHeight(16777215)
-        if self.geometry().topLeft() != geo.topLeft():
-            self.move(geo.topLeft())
         self.panel.finish_capture(img)
+        self._fit_on_screen()
         self._bg_busy = False
 
     def showEvent(self, e):
@@ -1876,15 +1880,51 @@ class SentinelWindow(QWidget):
         self.ball.set_status(top_state, active)
         self._refit()
 
+    def _fit_on_screen(self):
+        """ 整窗必须落在屏幕可用区内。
+            否则窗口底部会被屏幕/任务栏直接裁掉 —— 表现就是最后一行只露半截。 """
+        if not self.isVisible():
+            return
+        avail = self.screen().availableGeometry()
+        g = self.geometry()
+        x, y = g.x(), g.y()
+        if y + g.height() > avail.bottom() - 2:
+            y = avail.bottom() - 2 - g.height()
+        if y < avail.top():
+            y = avail.top()
+        if x + g.width() > avail.right() + 1:
+            x = avail.right() + 1 - g.width()
+        if x < avail.left():
+            x = avail.left()
+        if (x, y) != (g.x(), g.y()):
+            self.move(x, y)
+
+    def _expand_settle(self):
+        """ 展开后校准：布局可能还差一次重算，重新量一次高度再落屏 """
+        if not self._expanded:
+            return
+        self._refit()
+        self._fit_on_screen()
+
     def _refit(self):
         """ 任务增减导致卡片变高/变矮时，窗口跟着走 """
         if not self._expanded:
             return
+        try:
+            self.layout().activate()
+        except Exception:
+            pass
+        before = self.geometry()
         need = self.sizeHint().height()
         if abs(need - self.height()) > 1:
-            right = self.geometry().right()
+            right = before.right()
             self.resize(self.PANEL_WIDTH, need)
-            self.move(right - self.PANEL_WIDTH + 1, self.y())
+            y = self._anchor_top if self._anchor_top is not None else before.y()
+            self.move(right - self.PANEL_WIDTH + 1, y)
+        self._fit_on_screen()
+        if self.geometry().topLeft() != before.topLeft():
+            # 被屏幕边界顶上去了 → 玻璃里那张背景已经对不上，重新抓一次
+            self._bg_timer.start(320)
 
     # ---- 拖动（面板模式下拖窗口空白处；宠物形态由 PetWidget 回调） ----
     def _drag_start(self, global_pos):
@@ -1907,8 +1947,10 @@ class SentinelWindow(QWidget):
         self._after_drag()
 
     def _after_drag(self):
+        self._anchor_top = self.y()
         # 挪过位置后背景就变了，延迟重抓一次（晚一点抓，拖完的瞬间别闪）
         if self._expanded:
+            self._fit_on_screen()
             QTimer.singleShot(280, lambda: self._snap_backdrop(50))
 
 
