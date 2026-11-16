@@ -1818,41 +1818,32 @@ class SentinelWindow(QWidget):
         right_edge = self.geometry().right()
         top = self.geometry().top()
         if self._expanded:
-            # 尺寸一次算准：先让布局激活，再一次性 resize。
-            # 以前是 setVisible→setFixedWidth→adjustSize 连续三次改尺寸，
-            # Qt 每次都要重建 backing store，肉眼就是「闪一下」。
-            self.setUpdatesEnabled(False)
+            # 尺寸一次算准：先让布局激活算出高度，再一次性 resize。
+            # 注意：**不要**用 setUpdatesEnabled(False) 抑制中间的绘制 ——
+            # 抑制期间改尺寸只会标记部分脏区，恢复后上半截留着透明、
+            # 背后内容直接透出来（就是「先白一点、然后变透明」的元凶）。
+            self.panel.setVisible(True)
+            self.setFixedWidth(self.PANEL_WIDTH)
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
             try:
-                self.panel.setVisible(True)
-                self.setFixedWidth(self.PANEL_WIDTH)
-                self.setMinimumHeight(0)
-                self.setMaximumHeight(16777215)
-                try:
-                    self.layout().activate()
-                except Exception:
-                    pass
-                self.resize(self.PANEL_WIDTH, self.sizeHint().height())
-            finally:
-                self.setUpdatesEnabled(True)
+                self.layout().activate()
+            except Exception:
+                pass
+            self.resize(self.PANEL_WIDTH, self.sizeHint().height())
             if self.isVisible():
                 self._anchor_top = top
                 self.move(max(0, right_edge - self.width() + 1), top)
                 self._fit_on_screen()
-            self.repaint()
             # 布局是惰性的：展开瞬间拿到的 sizeHint 可能还差一次计算，
             # 稍后再校准一轮，然后再抓背景（保证抓的是最终尺寸）
             QTimer.singleShot(30, self._expand_settle)
             QTimer.singleShot(90, lambda: self._snap_backdrop(0))
         else:
-            self.setUpdatesEnabled(False)
-            try:
-                self.panel.setVisible(False)
-                self.setFixedSize(self.ball.px(), self.ball.px())
-            finally:
-                self.setUpdatesEnabled(True)
+            self.panel.setVisible(False)
+            self.setFixedSize(self.ball.px(), self.ball.px())
             if self.isVisible():
                 self.move(max(0, right_edge - self.ball.px() + 1), top)
-            self.repaint()
 
     # ---- 玻璃背景：抓窗口背后的桌面，模糊后贴到面板底层 ----
     def _snap_backdrop(self, delay=60):
@@ -1902,8 +1893,8 @@ class SentinelWindow(QWidget):
                 self._set_capture_excluded(False)
                 self._excluded = False
         self.panel.finish_capture(img)
-        launch_log("backdrop %dx%d -> panel %dx%d" % (
-            img.width(), img.height(), self.panel.width(), self.panel.height()))
+        if img.isNull():
+            launch_log("backdrop 抓取失败，退化为纯色玻璃")
         self._fit_on_screen()
         self._bg_busy = False
 
