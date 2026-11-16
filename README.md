@@ -26,7 +26,7 @@
 | WorkBuddy 国内版 / 国际版 | **本地 SQLite 会话表监听**（自动显示会话标题与状态） |
 | Claude Desktop | **本地会话 JSON + 回合记录监听**（实时，含会话标题） |
 | Cursor | **agent 回合记录监听**（`~/.cursor` 下的 transcript，实时，含提问摘要） |
-| Grok Bot | **会话 blob 监听**（`sand-client-persistence`，流式生成标记 + 对话正文） |
+| Grok Bot | **进程 CPU 活动检测**（对话在远端沙箱，本地无实时状态落盘） |
 
 ## 安装与启动
 
@@ -185,29 +185,43 @@ Cursor 的 agent 把每回合的完整过程写到本地，格式和 Claude Code
 - `done_minutes`：回合结束后「已完成」保留多久
 - 一个 transcript = 一个任务，多项目并行时能同时挂多条
 
-## 会话 blob 监听（Grok Bot）
+## 进程 CPU 活动检测（Grok Bot）
 
-Grok Bot（内部代号 sand）把每个会话持久化成一份 blob：
+Grok Bot（内部代号 sand）的对话跑在**远端沙箱**里，本地拿不到实时会话状态。
+实测下来，三条常见路子都走不通：
 
-```
-%APPDATA%\Grok Bot\sand-client-persistence\<长哈希>.blob
-```
+| 尝试 | 结果 |
+|---|---|
+| 读会话 blob | `sand-client-persistence\*.blob` 只在应用**退出时**才 flush（asar 里确认是 `will-quit` 时落盘），生成过程中不会实时更新 |
+| 监听 TCP 连接 | 空闲时就常驻 10+ 条到 AWS 的 HTTPS 连接，连接数无法区分忙闲 |
+| 窗口标题 | 恒为 `Grok Bot`，不随对话变化 |
 
-内容是 `{"schemaVersion":1,"value":{"entries":[...]}}`，每个 entry 带
-`kind`（message / send-message）、`role`、`timestampMs`、`isStreaming`。
+**但 CPU 是干净的**：空闲时整棵进程树的 CPU 时间几乎为 0（实测 0~16ms / 3 秒），
+流式生成时渲染进程必须持续解析和绘制增量内容，CPU 会明显升高。
 
-- 最后一条 entry 的 `isStreaming` 为 `true` → 正在流式生成 → **工作中**
-- 否则按最新 `timestampMs` 判定：刚聊过 → **已完成**，久一点 → 空闲
+所以判定逻辑是：
+
+- 进程树 CPU 时间增量 ≥ `cpu_ms`（默认 120ms / 3 秒）→ **工作中**
+- 停止后维持 9 秒 → **已完成**，再保持 `done_seconds` → 回到**空闲**
+- 连续两轮都超阈值才算「工作中」，过滤偶发尖峰
 
 ```json
-"watch_blob": {
-  "dir": "%APPDATA%\\Grok Bot\\sand-client-persistence",
-  "done_minutes": 10
+"watch_grok": {
+  "process": "grok bot.exe",
+  "cpu_ms": 120,
+  "io_bytes": 20000,
+  "done_seconds": 45,
+  "blob_dir": "%APPDATA%\\Grok Bot\\sand-client-persistence"
 }
 ```
 
-> 坑：blob 的文件名是超长哈希，整体路径超过 Windows 的 260 字符限制，
-> 普通 `open()` 会直接报 `FileNotFoundError`，必须用 `\\?\` 长路径前缀访问。
+任务标题从 blob 里取最近一条用户提问（正文在 `richText` 的 ProseMirror
+文档 JSON 里，需要递归找 `type: "text"` 节点）。blob 更新有延迟，
+仅用于显示标题，不参与状态判定。
+
+> 坑：blob 路径超 260 字符，必须用 `\\?\` 长路径前缀访问。
+> 且这个前缀要**幂等**——`scandir` 在长路径目录下返回的条目路径本身已带前缀，
+> 再套一次会变成 `\\?\UNC\?\C:\...` 而打不开。
 
 ## 上报接口
 

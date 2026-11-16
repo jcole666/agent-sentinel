@@ -550,10 +550,15 @@ def run_json_watcher(store, agents, stop_event):
 
 def _long_win_path(p):
     """ Windows 上整体路径超过 260 字符时，普通 open() 直接报 FileNotFoundError，
-    需要加 \\\\?\\ 长路径前缀。 """
+    需要加 \\\\?\\ 长路径前缀。
+
+    注意要幂等：scandir 在长路径目录下返回的条目路径本身已带前缀，
+    再套一次会变成 "\\\\?\\UNC\\?\\C:\\..." 而打不开。 """
     if os.name != "nt":
         return p
     ap = os.path.abspath(p)
+    if ap.startswith("\\\\?\\") or ap.startswith("\\\\?\\UNC\\"):
+        return ap
     if ap.startswith("\\\\"):
         return "\\\\?\\UNC\\" + ap[2:]
     return "\\\\?\\" + ap
@@ -658,93 +663,189 @@ def run_cursor_watcher(store, agents, stop_event):
         stop_event.wait(3.0)
 
 
-def run_blob_watcher(store, agents, stop_event):
-    """ Grok Bot（内部代号 sand）把每个会话持久化成
-        %APPDATA%\\Grok Bot\\sand-client-persistence\\<长哈希>.blob，
-      内容形如 {"schemaVersion":1,"value":{"entries":[...]}}，
-      entry 带 kind=message/send-message、role、timestampMs、isStreaming。
+def _proc_tree_cpu_io(pname):
+    """ 返回该进程名所有实例的 (cpu_seconds, io_bytes) 累计值。
 
-      判定「进行中」：会话最后一条 entry 的 isStreaming 为 true，说明还在流式生成。
-      任务名取该会话最后一条用户消息的正文。
+    cpu 取 user+system 时间（跨进程取和），io 取 read+write 字节。
+    Windows 的 io_counters 含网络收发，生成回复时远端沙箱的流式数据
+    会明显推高这个值。 """
+    cpu = 0.0
+    io = 0
+    pids = []
+    for p in psutil.process_iter(["name", "pid"]):
+        if (p.info["name"] or "").lower() == pname:
+            pids.append(p.info["pid"])
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            c = proc.cpu_times()
+            cpu += c.user + c.system
+            i = proc.io_counters()
+            io += i.read_bytes + i.write_bytes
+        except Exception:
+            continue
+    return cpu, io, len(pids)
 
-      注意：blob 文件名极长（整体路径 > 260 字符），普通 open() 会报
-      FileNotFoundError，必须用 \\\\?\\ 长路径前缀访问。 """
-    watched = [(a["id"], a["watch_blob"]) for a in agents if a.get("watch_blob")]
+
+def run_grok_watcher(store, agents, stop_event):
+    """ Grok Bot（内部代号 sand）：对话跑在远端沙箱里，本地拿不到实时会话状态。
+
+    实测结论：
+      - %APPDATA%\\Grok Bot\\sand-client-persistence\\*.blob 只在应用退出时 flush，
+        生成过程中不会实时落盘（asar 里能确认是 will-quit 时才落盘）；
+      - 空闲时它常驻 10+ 条到 AWS 的 HTTPS 连接，TCP 连接数没法区分忙闲；
+      - 但空闲时 CPU 几乎为 0（实测 0~16ms / 3 秒），流式生成时渲染进程
+        必须持续解析和绘制增量内容，CPU 会明显升高。
+
+    所以这里用「进程树 CPU 时间增量」作为主信号：连续两轮超过阈值 = 工作中，
+    回落 = 完成。任务名从 blob 里取最近一条用户提问（blob 更新有延迟，
+    但用于显示对话标题足够）。
+    """
+    watched = [(a["id"], a["watch_grok"]) for a in agents if a.get("watch_grok")]
     if not watched:
         return
-    seen = {}
-
-    def list_blobs(d):
-        out = []
-        try:
-            with os.scandir(_long_win_path(d)) as it:
-                for e in it:
-                    if e.is_file() and e.name.endswith(".blob"):
-                        out.append(e.name)
-        except Exception:
-            pass
-        return out
+    prev = {}        # aid -> (cpu, io, pid_count)
+    last_active = {}  # aid -> 最后一次检测到活动的时间
+    done_until = {}   # aid -> 「已完成」状态的截止时间
+    streak = {}       # aid -> 连续超阈值的轮数（防抖）
+    TASK_ID = "grok"
 
     while not stop_event.is_set():
         try:
             now = time.time()
             for aid, cfg in watched:
-                d = os.path.expandvars(cfg.get("dir", ""))
-                if not d:
+                pname = (cfg.get("process") or "grok bot.exe").lower()
+                cpu_ms = float(cfg.get("cpu_ms", 120))       # 3 秒窗口的 CPU 阈值
+                io_bytes = float(cfg.get("io_bytes", 20000))  # 3 秒窗口的 IO 阈值
+                done_sec = float(cfg.get("done_seconds", 45))
+
+                cpu, io, nproc = _proc_tree_cpu_io(pname)
+                if nproc == 0:
+                    prev.pop(aid, None)
+                    streak.pop(aid, None)
+                    last_active.pop(aid, None)
+                    done_until.pop(aid, None)
+                    store.report(aid, "idle", task_id=TASK_ID)
                     continue
-                done_min = float(cfg.get("done_minutes", 10))
-                cur = set()
-                best = None       # (timestamp, task_id, prompt, streaming)
-                for name in list_blobs(d):
-                    try:
-                        with open(_long_win_path(os.path.join(d, name)), "r",
-                                  encoding="utf-8", errors="ignore") as fh:
-                            data = json.load(fh)
-                    except Exception:
-                        continue
-                    v = data.get("value") if isinstance(data, dict) else None
-                    if not isinstance(v, dict):
-                        continue
-                    entries = v.get("entries")
-                    if not isinstance(entries, list) or not entries:
-                        continue
-                    ts = 0.0
-                    prompt = ""
-                    for e in entries:
-                        if not isinstance(e, dict):
-                            continue
-                        ets = e.get("timestampMs") or 0
-                        if ets:
-                            ts = max(ts, ets / 1000.0)
-                        if e.get("role") == "user":
-                            txt = e.get("content")
-                            if isinstance(txt, str) and txt.strip():
-                                prompt = txt.strip()
-                        m = e.get("message") if isinstance(e.get("message"), dict) else {}
-                        if e.get("kind") == "send-message" and m.get("type") == "text":
-                            txt = m.get("content")
-                            if isinstance(txt, str) and txt.strip() and not prompt:
-                                prompt = txt.strip()
-                    last = entries[-1] if isinstance(entries[-1], dict) else {}
-                    streaming = bool(last.get("isStreaming"))
-                    if best is None or ts > best[0]:
-                        best = (ts, name[:18], prompt, streaming)
-                if best is not None:
-                    ts, tid, prompt, streaming = best
-                    if streaming:
-                        cur.add(tid)
-                        store.report(aid, "working", (prompt or "Grok Bot 对话")[:60],
-                                     task_id=tid)
-                    elif ts and now - ts <= done_min * 60:
-                        cur.add(tid)
-                        store.report(aid, "done", (prompt or "Grok Bot 对话")[:60],
-                                     task_id=tid)
-                for gone in (seen.get(aid, set()) - cur):
-                    store.report(aid, "idle", task_id=gone)
-                seen[aid] = cur
+
+                old = prev.get(aid)
+                prev[aid] = (cpu, io, nproc)
+                if old is None:
+                    continue
+                d_cpu_ms = (cpu - old[0]) * 1000.0
+                d_io = io - old[1]
+
+                busy = d_cpu_ms >= cpu_ms or d_io >= io_bytes
+                if busy:
+                    streak[aid] = streak.get(aid, 0) + 1
+                    if streak[aid] >= 2:      # 连续两轮都忙才算，过滤偶发尖峰
+                        last_active[aid] = now
+                else:
+                    streak[aid] = 0
+
+                # 任务名：从 blob 里取最近一条用户提问
+                title = _grok_last_prompt(cfg.get("blob_dir", ""))
+                # 状态机：
+                #   活跃中 → working
+                #   停止后先维持一小段 working（等最后一批渲染收尾），
+                #   再转 done 并保持 done_seconds，最后回 idle 并清空任务
+                hold = float(cfg.get("active_hold_seconds", 9))
+                if aid in last_active and quiet < hold:
+                    store.report(aid, "working", (title or "Grok Bot 对话")[:60],
+                                 task_id=TASK_ID)
+                elif aid in last_active:
+                    last_active.pop(aid, None)
+                    done_until[aid] = now + done_sec
+                    store.report(aid, "done", (title or "Grok Bot 对话")[:60],
+                                 task_id=TASK_ID)
+                elif aid in done_until:
+                    if now < done_until[aid]:
+                        store.report(aid, "done", (title or "Grok Bot 对话")[:60],
+                                     task_id=TASK_ID)
+                    else:
+                        done_until.pop(aid, None)
+                        store.report(aid, "idle", task_id=TASK_ID)
+                else:
+                    store.report(aid, "idle", task_id=TASK_ID)
         except Exception:
             pass
         stop_event.wait(3.0)
+
+
+def _grok_last_prompt(blob_dir):
+    """ 从 Grok 的 blob 持久化里取最近一条用户提问，作为任务标题。
+
+    blob 路径超 260 字符，必须用 \\\\?\\ 长路径前缀访问。
+    """
+    d = os.path.expandvars(blob_dir or "")
+    if not d or not os.path.isdir(_long_win_path(d)):
+        return ""
+    best = (0.0, "")
+    try:
+        with os.scandir(_long_win_path(d)) as it:
+            for e in it:
+                if not (e.is_file() and e.name.endswith(".blob")):
+                    continue
+                try:
+                    with open(_long_win_path(e.path), "r", encoding="utf-8",
+                              errors="ignore") as fh:
+                        data = json.load(fh)
+                except Exception:
+                    continue
+                v = data.get("value") if isinstance(data, dict) else None
+                if not isinstance(v, dict):
+                    continue
+                entries = v.get("entries")
+                if not isinstance(entries, list):
+                    continue
+                ts = 0.0
+                prompt = ""
+                for ent in entries:
+                    if not isinstance(ent, dict):
+                        continue
+                    ets = ent.get("timestampMs") or 0
+                    if ets:
+                        ts = max(ts, ets / 1000.0)
+                    if ent.get("role") != "user":
+                        continue
+                    txt = _grok_text(ent)
+                    if txt:
+                        prompt = txt
+                if ts > best[0]:
+                    best = (ts, prompt)
+    except Exception:
+        pass
+    return best[1]
+
+
+def _grok_text(entry):
+    """ 从一条 entry 里抽出纯文本正文（richText 是 ProseMirror 文档 JSON）。 """
+    raw = entry.get("richText")
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+    if isinstance(raw, dict):
+        parts = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("type") == "text" and isinstance(node.get("text"), str):
+                    parts.append(node["text"])
+                for val in node.values():
+                    walk(val)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(raw)
+        if parts:
+            return " ".join(parts).strip()
+    txt = entry.get("content")
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+    return ""
 
 
 def run_net_watcher(store, agents, stop_event):
@@ -1458,7 +1559,7 @@ def main():
     threading.Thread(target=run_json_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_net_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_cursor_watcher, args=(store, agents, stop_event), daemon=True).start()
-    threading.Thread(target=run_blob_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_grok_watcher, args=(store, agents, stop_event), daemon=True).start()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
