@@ -11,6 +11,7 @@ Agent 哨兵 (Agent Sentinel)
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -536,6 +537,208 @@ def run_json_watcher(store, agents, stop_event):
                         continue
                     store.report(aid, state, title[:60], task_id=task_id)
 
+                for gone in (seen.get(aid, set()) - cur):
+                    store.report(aid, "idle", task_id=gone)
+                seen[aid] = cur
+        except Exception:
+            pass
+        stop_event.wait(3.0)
+
+
+# ------------------------------------------------- Cursor / Grok Bot 专用监听
+
+
+def _long_win_path(p):
+    """ Windows 上整体路径超过 260 字符时，普通 open() 直接报 FileNotFoundError，
+    需要加 \\\\?\\ 长路径前缀。 """
+    if os.name != "nt":
+        return p
+    ap = os.path.abspath(p)
+    if ap.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + ap[2:]
+    return "\\\\?\\" + ap
+
+
+def _user_prompt_from_transcript(lines):
+    """ 从 Cursor transcript 里取首条用户提问（正文包在 <user_query> 标签里）。
+
+    Cursor 的 role 在顶层（{"role":"user","message":{...}}），
+    Claude Desktop 那种在 message 里（{"type":"user","message":{"role":...}}），
+    两种都兼容。 """
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        role = d.get("role") or msg.get("role")
+        if role != "user":
+            continue
+        c = msg.get("content")
+        txt = ""
+        if isinstance(c, str):
+            txt = c
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    txt = str(b.get("text", ""))
+                    break
+        m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", txt, re.S)
+        got = (m.group(1) if m else txt).strip()
+        if got:
+            return got
+    return ""
+
+
+def run_cursor_watcher(store, agents, stop_event):
+    """ Cursor 的 agent 回合记录在
+        %USERPROFILE%\\.cursor\\projects\\<project>\\agent-transcripts\\<uuid>\\<uuid>.jsonl
+      格式和 Claude Code 的 transcript 一致（role + message.content）。
+
+      判定「进行中」的关键：回合结束会追加最后一行
+      {"type":"turn_ended","status":"success|error"}；
+      还没出现 turn_ended 就说明 agent 还在跑（持续追加 tool_use / tool_result）。
+      任务名取首条 user 消息里 <user_query> 的内容。 """
+    watched = [(a["id"], a["watch_cursor"]) for a in agents if a.get("watch_cursor")]
+    if not watched:
+        return
+    import glob as _glob
+    seen = {}
+
+    while not stop_event.is_set():
+        try:
+            now = time.time()
+            for aid, cfg in watched:
+                pat = os.path.expandvars(cfg.get("transcript_glob", ""))
+                if not pat:
+                    continue
+                active_sec = float(cfg.get("active_seconds", 300))
+                done_min = float(cfg.get("done_minutes", 10))
+                cur = set()
+                for path in _glob.glob(pat):
+                    try:
+                        mtime = os.stat(path).st_mtime
+                    except Exception:
+                        continue
+                    try:
+                        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                            lines = fh.read().splitlines()
+                    except Exception:
+                        continue
+                    if not lines:
+                        continue
+                    finished = False
+                    status = ""
+                    for line in lines[-40:]:
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        if d.get("type") == "turn_ended":
+                            finished = True
+                            status = str(d.get("status") or "")
+                    if finished:
+                        # 回合已结束：短时间内显示「已完成」，再久就消失
+                        if now - mtime > done_min * 60:
+                            continue
+                        state = "error" if status == "error" else "done"
+                    else:
+                        if now - mtime > active_sec:
+                            continue
+                        state = "working"
+                    prompt = _user_prompt_from_transcript(lines[:60])
+                    tid = os.path.splitext(os.path.basename(path))[0]
+                    cur.add(tid)
+                    store.report(aid, state, (prompt or "Cursor 任务")[:60], task_id=tid)
+                for gone in (seen.get(aid, set()) - cur):
+                    store.report(aid, "idle", task_id=gone)
+                seen[aid] = cur
+        except Exception:
+            pass
+        stop_event.wait(3.0)
+
+
+def run_blob_watcher(store, agents, stop_event):
+    """ Grok Bot（内部代号 sand）把每个会话持久化成
+        %APPDATA%\\Grok Bot\\sand-client-persistence\\<长哈希>.blob，
+      内容形如 {"schemaVersion":1,"value":{"entries":[...]}}，
+      entry 带 kind=message/send-message、role、timestampMs、isStreaming。
+
+      判定「进行中」：会话最后一条 entry 的 isStreaming 为 true，说明还在流式生成。
+      任务名取该会话最后一条用户消息的正文。
+
+      注意：blob 文件名极长（整体路径 > 260 字符），普通 open() 会报
+      FileNotFoundError，必须用 \\\\?\\ 长路径前缀访问。 """
+    watched = [(a["id"], a["watch_blob"]) for a in agents if a.get("watch_blob")]
+    if not watched:
+        return
+    seen = {}
+
+    def list_blobs(d):
+        out = []
+        try:
+            with os.scandir(_long_win_path(d)) as it:
+                for e in it:
+                    if e.is_file() and e.name.endswith(".blob"):
+                        out.append(e.name)
+        except Exception:
+            pass
+        return out
+
+    while not stop_event.is_set():
+        try:
+            now = time.time()
+            for aid, cfg in watched:
+                d = os.path.expandvars(cfg.get("dir", ""))
+                if not d:
+                    continue
+                done_min = float(cfg.get("done_minutes", 10))
+                cur = set()
+                best = None       # (timestamp, task_id, prompt, streaming)
+                for name in list_blobs(d):
+                    try:
+                        with open(_long_win_path(os.path.join(d, name)), "r",
+                                  encoding="utf-8", errors="ignore") as fh:
+                            data = json.load(fh)
+                    except Exception:
+                        continue
+                    v = data.get("value") if isinstance(data, dict) else None
+                    if not isinstance(v, dict):
+                        continue
+                    entries = v.get("entries")
+                    if not isinstance(entries, list) or not entries:
+                        continue
+                    ts = 0.0
+                    prompt = ""
+                    for e in entries:
+                        if not isinstance(e, dict):
+                            continue
+                        ets = e.get("timestampMs") or 0
+                        if ets:
+                            ts = max(ts, ets / 1000.0)
+                        if e.get("role") == "user":
+                            txt = e.get("content")
+                            if isinstance(txt, str) and txt.strip():
+                                prompt = txt.strip()
+                        m = e.get("message") if isinstance(e.get("message"), dict) else {}
+                        if e.get("kind") == "send-message" and m.get("type") == "text":
+                            txt = m.get("content")
+                            if isinstance(txt, str) and txt.strip() and not prompt:
+                                prompt = txt.strip()
+                    last = entries[-1] if isinstance(entries[-1], dict) else {}
+                    streaming = bool(last.get("isStreaming"))
+                    if best is None or ts > best[0]:
+                        best = (ts, name[:18], prompt, streaming)
+                if best is not None:
+                    ts, tid, prompt, streaming = best
+                    if streaming:
+                        cur.add(tid)
+                        store.report(aid, "working", (prompt or "Grok Bot 对话")[:60],
+                                     task_id=tid)
+                    elif ts and now - ts <= done_min * 60:
+                        cur.add(tid)
+                        store.report(aid, "done", (prompt or "Grok Bot 对话")[:60],
+                                     task_id=tid)
                 for gone in (seen.get(aid, set()) - cur):
                     store.report(aid, "idle", task_id=gone)
                 seen[aid] = cur
@@ -1254,6 +1457,8 @@ def main():
     threading.Thread(target=run_turn_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_json_watcher, args=(store, agents, stop_event), daemon=True).start()
     threading.Thread(target=run_net_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_cursor_watcher, args=(store, agents, stop_event), daemon=True).start()
+    threading.Thread(target=run_blob_watcher, args=(store, agents, stop_event), daemon=True).start()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

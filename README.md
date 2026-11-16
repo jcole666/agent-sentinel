@@ -25,6 +25,8 @@
 | DeepSeek Harness | **TCP 连接监听**（生成回复必有 API 长连接，空闲即不显示任务） |
 | WorkBuddy 国内版 / 国际版 | **本地 SQLite 会话表监听**（自动显示会话标题与状态） |
 | Claude Desktop | **本地会话 JSON + 回合记录监听**（实时，含会话标题） |
+| Cursor | **agent 回合记录监听**（`~/.cursor` 下的 transcript，实时，含提问摘要） |
+| Grok Bot | **会话 blob 监听**（`sand-client-persistence`，流式生成标记 + 对话正文） |
 
 ## 安装与启动
 
@@ -157,6 +159,55 @@ Claude Desktop 的本地 agent 会话会写到磁盘，不需要它配合上报�
 - 只读，**只取标题与时间，不读消息正文**
 
 > 注意：只覆盖 Claude Desktop 的**本地 agent 模式**会话。纯云端聊天不会在本地落盘，哨兵无法感知。
+
+## agent 回合记录监听（Cursor）
+
+Cursor 的 agent 把每回合的完整过程写到本地，格式和 Claude Code 的 transcript 一致：
+
+```
+%USERPROFILE%\.cursor\projects\<项目>\agent-transcripts\<uuid>\<uuid>.jsonl
+```
+
+- 每行形如 `{"role":"user","message":{"content":[{"type":"text","text":"..."}]}}`
+- 首个用户消息里正文包在 `<user_query>` 标签中，哨兵拿它当任务标题
+- **回合结束会追加最后一行** `{"type":"turn_ended","status":"success|error"}`；
+  还没出现 `turn_ended` 就说明 agent 还在跑（持续追加 tool_use / tool_result）
+
+```json
+"watch_cursor": {
+  "transcript_glob": "%USERPROFILE%\\.cursor\\projects\\*\\agent-transcripts\\*\\*.jsonl",
+  "active_seconds": 300,
+  "done_minutes": 10
+}
+```
+
+- `active_seconds`：transcript 的静默超时（超过就认为没在跑）
+- `done_minutes`：回合结束后「已完成」保留多久
+- 一个 transcript = 一个任务，多项目并行时能同时挂多条
+
+## 会话 blob 监听（Grok Bot）
+
+Grok Bot（内部代号 sand）把每个会话持久化成一份 blob：
+
+```
+%APPDATA%\Grok Bot\sand-client-persistence\<长哈希>.blob
+```
+
+内容是 `{"schemaVersion":1,"value":{"entries":[...]}}`，每个 entry 带
+`kind`（message / send-message）、`role`、`timestampMs`、`isStreaming`。
+
+- 最后一条 entry 的 `isStreaming` 为 `true` → 正在流式生成 → **工作中**
+- 否则按最新 `timestampMs` 判定：刚聊过 → **已完成**，久一点 → 空闲
+
+```json
+"watch_blob": {
+  "dir": "%APPDATA%\\Grok Bot\\sand-client-persistence",
+  "done_minutes": 10
+}
+```
+
+> 坑：blob 的文件名是超长哈希，整体路径超过 Windows 的 260 字符限制，
+> 普通 `open()` 会直接报 `FileNotFoundError`，必须用 `\\?\` 长路径前缀访问。
 
 ## 上报接口
 
