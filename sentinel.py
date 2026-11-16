@@ -1205,12 +1205,10 @@ class GlassPanel(QWidget):
                 self._bg_alpha = 1.0
                 self.update()
             return
-        self._backdrop = _blur_image(img)
-        self._bg_alpha = 0.0
         self._bg_anim.stop()
-        self._bg_anim.setStartValue(0.0)
-        self._bg_anim.setEndValue(1.0)
-        self._bg_anim.start()
+        self._backdrop = _blur_image(img)
+        self._bg_alpha = 1.0
+        self.update()
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -1232,9 +1230,9 @@ class GlassPanel(QWidget):
             p.fillRect(rect, QColor(246, 247, 250))
         # 白霜（玻璃的“乳白感”都在这层）
         g = QLinearGradient(0, rect.top(), 0, rect.bottom())
-        g.setColorAt(0.0, QColor(255, 255, 255, 200))
-        g.setColorAt(0.55, QColor(250, 252, 255, 188))
-        g.setColorAt(1.0, QColor(240, 244, 250, 178))
+        g.setColorAt(0.0, QColor(255, 255, 255, 226))
+        g.setColorAt(0.55, QColor(252, 253, 255, 216))
+        g.setColorAt(1.0, QColor(244, 247, 252, 208))
         p.fillPath(path, QBrush(g))
         # 左上角柔光，制造曲面反光
         rad = QRadialGradient(QPointF(rect.left() + rect.width() * 0.18,
@@ -1809,6 +1807,7 @@ class SentinelWindow(QWidget):
     def apply_pet_size(self):
         """ 宠物缩放后：收起态同步窗口大小，保持右边缘不动 """
         if not self._expanded:
+            QTimer.singleShot(600, self._prefetch_backdrop)
             right = self.geometry().right()
             top = self.geometry().top()
             self.setFixedSize(self.ball.px(), self.ball.px())
@@ -1912,6 +1911,42 @@ class SentinelWindow(QWidget):
         super().showEvent(e)
         if self._expanded and not self._bg_busy:
             self._snap_backdrop(120)
+        elif not self._expanded:
+            # 收起状态下窗口只有小球，压根不覆盖面板区域 → 现在就能把
+            # 展开后要用的背景拍好。首次展开因此不会先白一下。
+            QTimer.singleShot(1500, self._prefetch_backdrop)
+
+    def _expanded_panel_rect(self):
+        """ 预估「展开后」面板在屏幕上的矩形（收起时用） """
+        try:
+            self.layout().activate()
+            ph = self.panel.sizeHint().height()
+            pw = self.PANEL_WIDTH
+            if ph < 60 or pw < 120:
+                return None
+            g = self.geometry()
+            return QRect(g.right() + 1 - pw,
+                         g.top() + self.ball.height() + 6, pw, ph)
+        except Exception:
+            return None
+
+    def _prefetch_backdrop(self):
+        if self._expanded or self._bg_busy or not self.isVisible():
+            return
+        rect = self._expanded_panel_rect()
+        if rect is None:
+            return
+        img = QImage()
+        try:
+            pm = self.screen().grabWindow(0, rect.x(), rect.y(),
+                                          rect.width(), rect.height())
+            if pm is not None and not pm.isNull():
+                img = pm.toImage()
+        except Exception:
+            pass
+        if img.isNull():
+            return
+        self.panel.finish_capture(img)
 
     def toggle_visible(self):
         self.setVisible(not self.isVisible())
@@ -2019,6 +2054,8 @@ class SentinelWindow(QWidget):
         if self._expanded:
             self._fit_on_screen()
             QTimer.singleShot(220, lambda: self._snap_backdrop(0))
+        else:
+            QTimer.singleShot(400, self._prefetch_backdrop)
 
 
 # ---------------------------------------------------------------- 入口

@@ -66,6 +66,8 @@ Windows 下双击 `启动哨兵.vbs` 可静默后台启动（`python make_launch
 ## 界面：液态玻璃
 
 每个 Agent 是一张独立的玻璃卡片（不是表格行），整块面板是磨砂玻璃底。
+收起状态下窗口只有小球、不覆盖面板区域，所以会**提前把展开后要用的背景拍好**——
+点开面板就是成品，不会先白一下再变。
 
 **为什么不用 Win11 原生亚克力**：`SetWindowCompositionAttribute` 的 acrylic/blurbehind
 会把模糊铺满**整个窗口矩形**，既不会跟随圆角裁剪（圆角外是方的），也吃不到 `setMask`
