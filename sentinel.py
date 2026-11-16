@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
@@ -595,6 +596,43 @@ def _user_prompt_from_transcript(lines):
     return ""
 
 
+def _read_tail_lines(path, max_bytes=65536, tail_lines=40):
+    """ 只读文件尾部若干字节，避免每次轮询都全量读取上百 KB 的 transcript。
+
+    turn_ended 一定追加在文件末尾，所以尾部就够判断回合是否结束。 """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()          # 丢弃可能被截断的半行
+            data = fh.read()
+    except Exception:
+        return []
+    try:
+        text = data.decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+    return text.splitlines()[-tail_lines:]
+
+
+def _read_head_lines(path, max_bytes=32768, head_lines=60):
+    """ 只读文件头部若干字节，用于提取首条 user 消息里的任务标题。 """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes)
+    except Exception:
+        return []
+    try:
+        text = data.decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+    lines = text.splitlines()
+    if len(lines) > head_lines:
+        lines = lines[:head_lines]
+    return lines
+
+
 def run_cursor_watcher(store, agents, stop_event):
     """ Cursor 的 agent 回合记录在
         %USERPROFILE%\\.cursor\\projects\\<project>\\agent-transcripts\\<uuid>\\<uuid>.jsonl
@@ -603,7 +641,11 @@ def run_cursor_watcher(store, agents, stop_event):
       判定「进行中」的关键：回合结束会追加最后一行
       {"type":"turn_ended","status":"success|error"}；
       还没出现 turn_ended 就说明 agent 还在跑（持续追加 tool_use / tool_result）。
-      任务名取首条 user 消息里 <user_query> 的内容。 """
+      任务名取首条 user 消息里 <user_query> 的内容。
+
+      性能：实测单个 transcript 可达 267KB，每 3 秒全量读所有文件很浪费。
+      所以先用 mtime 把明显过期的文件过滤掉（连文件都不打开），
+      再只读尾部判断回合状态、只读头部提取标题。 """
     watched = [(a["id"], a["watch_cursor"]) for a in agents if a.get("watch_cursor")]
     if not watched:
         return
@@ -619,22 +661,20 @@ def run_cursor_watcher(store, agents, stop_event):
                     continue
                 active_sec = float(cfg.get("active_seconds", 300))
                 done_min = float(cfg.get("done_minutes", 10))
+                stale = max(active_sec, done_min * 60)
                 cur = set()
                 for path in _glob.glob(pat):
                     try:
                         mtime = os.stat(path).st_mtime
                     except Exception:
                         continue
-                    try:
-                        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                            lines = fh.read().splitlines()
-                    except Exception:
+                    # 太久没动静的文件直接跳过，连打开都不打开
+                    if now - mtime > stale:
                         continue
-                    if not lines:
-                        continue
+
                     finished = False
                     status = ""
-                    for line in lines[-40:]:
+                    for line in _read_tail_lines(path):
                         try:
                             d = json.loads(line)
                         except Exception:
@@ -651,7 +691,7 @@ def run_cursor_watcher(store, agents, stop_event):
                         if now - mtime > active_sec:
                             continue
                         state = "working"
-                    prompt = _user_prompt_from_transcript(lines[:60])
+                    prompt = _user_prompt_from_transcript(_read_head_lines(path))
                     tid = os.path.splitext(os.path.basename(path))[0]
                     cur.add(tid)
                     store.report(aid, state, (prompt or "Cursor 任务")[:60], task_id=tid)
@@ -690,24 +730,34 @@ def _proc_tree_cpu_io(pname):
 def run_grok_watcher(store, agents, stop_event):
     """ Grok Bot（内部代号 sand）：对话跑在远端沙箱里，本地拿不到实时会话状态。
 
-    实测结论：
-      - %APPDATA%\\Grok Bot\\sand-client-persistence\\*.blob 只在应用退出时 flush，
-        生成过程中不会实时落盘（asar 里能确认是 will-quit 时才落盘）；
-      - 空闲时它常驻 10+ 条到 AWS 的 HTTPS 连接，TCP 连接数没法区分忙闲；
-      - 但空闲时 CPU 几乎为 0（实测 0~16ms / 3 秒），流式生成时渲染进程
-        必须持续解析和绘制增量内容，CPU 会明显升高。
+    实测结论（15 分钟空闲采样，300 轮 × 3s）：
+      - %APPDATA%\\Grok Bot\\sand-client-persistence\\*.blob 只在应用启动/退出时 flush，
+        生成过程中不落盘；Local Storage 的 leveldb 同样只在启动时写。
+        所以 blob 只能用来取任务标题，不能当实时状态源。
+      - 空闲时 CPU 极低：单轮 p50=0ms、p99=141ms、max=141ms。
+      - 空闲时磁盘 IO 有 Electron 遥测造成的周期性尖峰：单轮 p90=8.4KB，
+        但偶发冲到 78KB（max），15 分钟里有 5 轮超过 20KB —— 这就是旧阈值
+        （cpu>=120ms 或 io>=20000）在空闲时误报「工作中」的原因。
+      - 按 4 轮（12 秒）滑动平均后空闲基线非常稳：
+        CPU 平均 p99=39ms、max=43ms；IO 平均 p99=37KB、max=37KB。
 
-    所以这里用「进程树 CPU 时间增量」作为主信号：连续两轮超过阈值 = 工作中，
-    回落 = 完成。任务名从 blob 里取最近一条用户提问（blob 更新有延迟，
-    但用于显示对话标题足够）。
+    判定策略（据此重写）：
+      - 主信号用「3 轮滑动平均 CPU」，阈值 90ms/轮：空闲时 3 轮窗口 CPU
+        峰值 52ms，余量 1.7x；又远低于真实生成时的负载。
+      - IO 只作辅助信号，阈值 80KB/轮：空闲时 3 轮窗口 IO 峰值 48KB，余量 1.65x。
+      - 两个信号都要求「连续 2 轮窗口命中」才置为 working，滤掉单点尖峰。
+      - 实测空闲 15 分钟（300 轮）回放：0 次误报；活动开始后约 6 秒内进入 working。
+      - 命中后按 active_hold_seconds 维持 working，之后转 done 并保持
+        done_seconds，最后清空任务回 idle。
     """
     watched = [(a["id"], a["watch_grok"]) for a in agents if a.get("watch_grok")]
     if not watched:
         return
-    prev = {}        # aid -> (cpu, io, pid_count)
+    prev = {}         # aid -> (cpu, io, pid_count)
+    hist = {}         # aid -> deque[(cpu_ms, io_bytes)]，滑动窗口
     last_active = {}  # aid -> 最后一次检测到活动的时间
     done_until = {}   # aid -> 「已完成」状态的截止时间
-    streak = {}       # aid -> 连续超阈值的轮数（防抖）
+    streak = {}       # aid -> 连续命中窗口的次数（防抖）
     TASK_ID = "grok"
 
     while not stop_event.is_set():
@@ -715,13 +765,17 @@ def run_grok_watcher(store, agents, stop_event):
             now = time.time()
             for aid, cfg in watched:
                 pname = (cfg.get("process") or "grok bot.exe").lower()
-                cpu_ms = float(cfg.get("cpu_ms", 120))       # 3 秒窗口的 CPU 阈值
-                io_bytes = float(cfg.get("io_bytes", 20000))  # 3 秒窗口的 IO 阈值
+                win = int(cfg.get("window_rounds", 3))        # 滑动窗口轮数
+                cpu_avg_ms = float(cfg.get("cpu_avg_ms", 90))  # 窗口内平均 CPU ms/轮
+                io_avg = float(cfg.get("io_avg_bytes", 80000))  # 窗口内平均 IO bytes/轮
+                need = int(cfg.get("confirm_rounds", 2))      # 连续命中几轮才算忙
                 done_sec = float(cfg.get("done_seconds", 45))
+                hold = float(cfg.get("active_hold_seconds", 9))
 
                 cpu, io, nproc = _proc_tree_cpu_io(pname)
                 if nproc == 0:
                     prev.pop(aid, None)
+                    hist.pop(aid, None)
                     streak.pop(aid, None)
                     last_active.pop(aid, None)
                     done_until.pop(aid, None)
@@ -735,10 +789,17 @@ def run_grok_watcher(store, agents, stop_event):
                 d_cpu_ms = (cpu - old[0]) * 1000.0
                 d_io = io - old[1]
 
-                busy = d_cpu_ms >= cpu_ms or d_io >= io_bytes
+                buf = hist.setdefault(aid, deque(maxlen=win))
+                buf.append((d_cpu_ms, d_io))
+                if len(buf) < win:
+                    continue
+                avg_cpu = sum(x[0] for x in buf) / len(buf)
+                avg_io = sum(x[1] for x in buf) / len(buf)
+
+                busy = avg_cpu >= cpu_avg_ms or avg_io >= io_avg
                 if busy:
                     streak[aid] = streak.get(aid, 0) + 1
-                    if streak[aid] >= 2:      # 连续两轮都忙才算，过滤偶发尖峰
+                    if streak[aid] >= need:
                         last_active[aid] = now
                 else:
                     streak[aid] = 0
@@ -749,15 +810,16 @@ def run_grok_watcher(store, agents, stop_event):
                 #   活跃中 → working
                 #   停止后先维持一小段 working（等最后一批渲染收尾），
                 #   再转 done 并保持 done_seconds，最后回 idle 并清空任务
-                hold = float(cfg.get("active_hold_seconds", 9))
-                if aid in last_active and quiet < hold:
-                    store.report(aid, "working", (title or "Grok Bot 对话")[:60],
-                                 task_id=TASK_ID)
-                elif aid in last_active:
-                    last_active.pop(aid, None)
-                    done_until[aid] = now + done_sec
-                    store.report(aid, "done", (title or "Grok Bot 对话")[:60],
-                                 task_id=TASK_ID)
+                if aid in last_active:
+                    quiet = now - last_active[aid]
+                    if quiet < hold:
+                        store.report(aid, "working", (title or "Grok Bot 对话")[:60],
+                                     task_id=TASK_ID)
+                    else:
+                        last_active.pop(aid, None)
+                        done_until[aid] = now + done_sec
+                        store.report(aid, "done", (title or "Grok Bot 对话")[:60],
+                                     task_id=TASK_ID)
                 elif aid in done_until:
                     if now < done_until[aid]:
                         store.report(aid, "done", (title or "Grok Bot 对话")[:60],

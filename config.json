@@ -79,9 +79,12 @@
       "proc_match": { "name": "grok bot.exe", "path_contains": "" },
       "watch_grok": {
         "process": "grok bot.exe",
-        "cpu_ms": 120,
-        "io_bytes": 20000,
+        "window_rounds": 3,
+        "cpu_avg_ms": 90,
+        "io_avg_bytes": 80000,
+        "confirm_rounds": 2,
         "done_seconds": 45,
+        "active_hold_seconds": 9,
         "blob_dir": "%APPDATA%\\Grok Bot\\sand-client-persistence"
       }
     }

@@ -185,32 +185,59 @@ Cursor 的 agent 把每回合的完整过程写到本地，格式和 Claude Code
 - `done_minutes`：回合结束后「已完成」保留多久
 - 一个 transcript = 一个任务，多项目并行时能同时挂多条
 
+> 性能：单个 transcript 实测可达 267KB。全量读所有文件每 3 秒一轮太浪费，
+> 所以先用 `mtime` 把明显过期的文件直接跳过（连打开都不打开），
+> 再**只读尾部**判断 `turn_ended`、**只读头部**提取任务标题。
+
 ## 进程 CPU 活动检测（Grok Bot）
 
 Grok Bot（内部代号 sand）的对话跑在**远端沙箱**里，本地拿不到实时会话状态。
-实测下来，三条常见路子都走不通：
+实测下来，四条常见路子都走不通：
 
 | 尝试 | 结果 |
 |---|---|
-| 读会话 blob | `sand-client-persistence\*.blob` 只在应用**退出时**才 flush（asar 里确认是 `will-quit` 时落盘），生成过程中不会实时更新 |
-| 监听 TCP 连接 | 空闲时就常驻 10+ 条到 AWS 的 HTTPS 连接，连接数无法区分忙闲 |
+| 读会话 blob | `sand-client-persistence\*.blob` 只在应用**启动/退出**时 flush（asar 里确认是 `will-quit` 时落盘），生成过程中不会实时更新 |
+| 读 Local Storage leveldb | `Partitions\sand-*\Local Storage\leveldb\000003.log` 同样只在启动时写，运行期间不再更新 |
+| 监听 TCP 连接 | 空闲时就常驻 12 条到 AWS / Cloudflare 的 HTTPS 连接，连接数无法区分忙闲 |
 | 窗口标题 | 恒为 `Grok Bot`，不随对话变化 |
 
-**但 CPU 是干净的**：空闲时整棵进程树的 CPU 时间几乎为 0（实测 0~16ms / 3 秒），
-流式生成时渲染进程必须持续解析和绘制增量内容，CPU 会明显升高。
+**但 CPU 是干净的**：空闲时整棵进程树的 CPU 时间几乎为 0。
+所以判定逻辑走「进程树 CPU / 磁盘 IO 增量 + 滑动窗口」。
 
-所以判定逻辑是：
+### 空闲基线（15 分钟实测，300 轮 × 3 秒）
 
-- 进程树 CPU 时间增量 ≥ `cpu_ms`（默认 120ms / 3 秒）→ **工作中**
-- 停止后维持 9 秒 → **已完成**，再保持 `done_seconds` → 回到**空闲**
-- 连续两轮都超阈值才算「工作中」，过滤偶发尖峰
+这是定阈值的依据。空闲时 Electron 遥测会造成**周期性 IO 尖峰**，
+单看单轮数据会误判，必须用滑动窗口抹平：
+
+| 指标 | 单轮 p50 | 单轮 p90 | 单轮 max | 3 轮窗口均值 max |
+|---|---|---|---|---|
+| CPU (ms) | 0 | 16 | 141 | **52** |
+| 磁盘 IO (字节) | 6906 | 8414 | 78887 | **48438** |
+
+> 旧阈值 `cpu>=120ms 或 io>=20000`（单轮）就是被这些尖峰击穿的：
+> 15 分钟里误报 6 次，其中 14:18 那次是**连续两轮**同时超标，
+> 会真的把 Grok 显示成「工作中」。这正是「空闲却一直亮着」的根因。
+
+### 当前判定
+
+- 3 轮（9 秒）滑动窗口平均 CPU ≥ `cpu_avg_ms`（默认 90ms）→ 命中
+- 或 3 轮窗口平均 IO ≥ `io_avg_bytes`（默认 80000 字节）→ 命中
+- 连续 `confirm_rounds`（默认 2）轮窗口命中才置为 **工作中**，滤掉单点尖峰
+- 停止后维持 `active_hold_seconds`（9 秒）→ **已完成**，
+  再保持 `done_seconds`（45 秒）→ 回到**空闲**并清空任务
+
+余量（相对空闲窗口峰值）：CPU 1.72x、IO 1.65x。
+离线回放 15 分钟真实空闲数据：**0 次误报**；活动开始后约 **6 秒**进入 working。
 
 ```json
 "watch_grok": {
   "process": "grok bot.exe",
-  "cpu_ms": 120,
-  "io_bytes": 20000,
+  "window_rounds": 3,
+  "cpu_avg_ms": 90,
+  "io_avg_bytes": 80000,
+  "confirm_rounds": 2,
   "done_seconds": 45,
+  "active_hold_seconds": 9,
   "blob_dir": "%APPDATA%\\Grok Bot\\sand-client-persistence"
 }
 ```
@@ -222,6 +249,9 @@ Grok Bot（内部代号 sand）的对话跑在**远端沙箱**里，本地拿不
 > 坑：blob 路径超 260 字符，必须用 `\\?\` 长路径前缀访问。
 > 且这个前缀要**幂等**——`scandir` 在长路径目录下返回的条目路径本身已带前缀，
 > 再套一次会变成 `\\?\UNC\?\C:\...` 而打不开。
+>
+> 坑：Windows 上 `psutil` 的 `io_counters()` 里 `rchar`/`wchar` 恒为 0，
+> 只有 `read_bytes`/`write_bytes`（磁盘 IO）有效，别指望用它们测网络流量。
 
 ## 上报接口
 
