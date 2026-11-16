@@ -1721,6 +1721,7 @@ class SentinelWindow(QWidget):
         self._bg_busy = False
         self._excluded = False
         self._anchor_top = None      # 期望的窗口顶边（越界上移只是临时避让）
+        self._collapsed_geo = None   # 收起态的位置，展开后再收起原样还回去
         self._bg_timer = QTimer(self)
         self._bg_timer.setSingleShot(True)
         self._bg_timer.timeout.connect(lambda: self._snap_backdrop(0))
@@ -1808,42 +1809,96 @@ class SentinelWindow(QWidget):
         """ 宠物缩放后：收起态同步窗口大小，保持右边缘不动 """
         if not self._expanded:
             QTimer.singleShot(600, self._prefetch_backdrop)
-            right = self.geometry().right()
-            top = self.geometry().top()
-            self.setFixedSize(self.ball.px(), self.ball.px())
-            self.move(max(0, right - self.ball.px() + 1), top)
+            g = self.geometry()
+            w = self.ball.px()
+            rect = self._fit_rect(QRect(g.right() + 1 - w, g.top(), w, w))
+            self._free_size()
+            self.setGeometry(rect)      # 位置+尺寸一次落定
+            self.setFixedSize(w, w)
+            self._collapsed_geo = QRect(rect)
+
+    # ---- 几何：位置和尺寸必须一次提交 ----
+    def _free_size(self):
+        """ 放开尺寸约束。
+
+            注意顺序：setFixedSize/setMaximumSize 在窗口可见时会把当前尺寸
+            **就地**夹进新约束（Qt 内部就是 resize()），这本身就是一次
+            原生窗口变更 → 又是一帧中间态。所以一律先放开约束、再 setGeometry，
+            最后才收紧。 """
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+
+    def _fit_rect(self, rect):
+        """ 把矩形夹进屏幕可用区（先解决底部越界，再解决顶部/左右） """
+        avail = self.screen().availableGeometry()
+        x, y = rect.x(), rect.y()
+        if y + rect.height() > avail.bottom() - 2:
+            y = avail.bottom() - 2 - rect.height()
+        if y < avail.top():
+            y = avail.top()
+        if x + rect.width() > avail.right() + 1:
+            x = avail.right() + 1 - rect.width()
+        if x < avail.left():
+            x = avail.left()
+        return QRect(x, y, rect.width(), rect.height())
+
+    def _expanded_height(self):
+        """ 展开后的窗口高度：小球 + 间距 + 面板。
+
+            刻意**不用** self.sizeHint()：那会激活根布局，而布局激活时会把
+            窗口先拉到「布局最小尺寸」——那又是一次就地 resize（小球会先
+            被甩到右边再回来）。只问面板自己的 sizeHint，面板不是窗口，
+            它的 sizeHint 不会反推整个窗口的尺寸。 """
+        try:
+            ph = self.panel.sizeHint().height()
+        except Exception:
+            ph = 0
+        if ph < 80:                 # 布局还没算出来 → 用当前高度兜底
+            ph = max(self.panel.height(), 80)
+        sp = self.layout().spacing()
+        return self.ball.px() + (6 if sp < 0 else sp) + ph
 
     def _apply_mode(self):
-        # 展开/收起时保持宠物位置不动：窗口右边缘固定，面板向左展开
-        right_edge = self.geometry().right()
-        top = self.geometry().top()
+        """ 展开/收起：位置和尺寸**一次 setGeometry 落定**。
+
+            以前是 resize() 再 move()，那是两次原生窗口变更，Windows 会把
+            它们各自合成一帧。收起时窗口先按「左上角不动」缩成小球 ——
+            小球于是瞬移到整块面板的左边缘，下一帧才被挪回右边；
+            看上去就是「点一下，小火人先跑到左边又马上弹回来」。
+            展开时同理，宽度先涨、右边缘甩到屏幕外，再被拉回来。
+            现在先算好目标矩形，位置+尺寸一起提交，不存在中间帧。
+            另外：**不要**用 setUpdatesEnabled(False) 抑制绘制 —— 那只会标
+            部分脏区，恢复后上半截留着透明，反而更花。 """
+        g = self.geometry()
         if self._expanded:
-            # 尺寸一次算准：先让布局激活算出高度，再一次性 resize。
-            # 注意：**不要**用 setUpdatesEnabled(False) 抑制中间的绘制 ——
-            # 抑制期间改尺寸只会标记部分脏区，恢复后上半截留着透明、
-            # 背后内容直接透出来（就是「先白一点、然后变透明」的元凶）。
-            self.panel.setVisible(True)
-            self.setFixedWidth(self.PANEL_WIDTH)
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
+            self._collapsed_geo = QRect(g)          # 记下小球原位，收起时还回去
+            self._free_size()
+            h = self._expanded_height()
+            rect = self._fit_rect(QRect(g.right() + 1 - self.PANEL_WIDTH,
+                                        g.top(), self.PANEL_WIDTH, h))
+            self._anchor_top = g.top()
+            self.setGeometry(rect)                  # 位置+尺寸一次到位
+            self.panel.setVisible(True)             # 窗口已经是最终尺寸了，面板直接出现在位
             try:
-                self.layout().activate()
+                self.layout().invalidate()
+                self.layout().activate()            # 同步排版好面板，避免下一帧错位
             except Exception:
                 pass
-            self.resize(self.PANEL_WIDTH, self.sizeHint().height())
-            if self.isVisible():
-                self._anchor_top = top
-                self.move(max(0, right_edge - self.width() + 1), top)
-                self._fit_on_screen()
-            # 布局是惰性的：展开瞬间拿到的 sizeHint 可能还差一次计算，
-            # 稍后再校准一轮，然后再抓背景（保证抓的是最终尺寸）
+            self.setFixedWidth(self.PANEL_WIDTH)    # 此刻宽度已就位，不会触发 resize
+            # 布局是惰性的：展开瞬间的高度可能差一两像素，稍后再校准一轮
             QTimer.singleShot(30, self._expand_settle)
             QTimer.singleShot(90, lambda: self._snap_backdrop(0))
         else:
+            w = self.ball.px()
+            back = self._collapsed_geo
+            if back is None or back.width() != w:
+                back = QRect(g.right() + 1 - w, g.top(), w, w)
+            rect = self._fit_rect(QRect(back))
+            self._free_size()
+            self.setGeometry(rect)                  # 先一次到位，此时面板已滑出窗口
             self.panel.setVisible(False)
-            self.setFixedSize(self.ball.px(), self.ball.px())
-            if self.isVisible():
-                self.move(max(0, right_edge - self.ball.px() + 1), top)
+            self.setFixedSize(w, w)
+            self._collapsed_geo = QRect(rect)
 
     # ---- 玻璃背景：抓窗口背后的桌面，模糊后贴到面板底层 ----
     def _snap_backdrop(self, delay=60):
@@ -1977,19 +2032,10 @@ class SentinelWindow(QWidget):
             否则窗口底部会被屏幕/任务栏直接裁掉 —— 表现就是最后一行只露半截。 """
         if not self.isVisible():
             return
-        avail = self.screen().availableGeometry()
         g = self.geometry()
-        x, y = g.x(), g.y()
-        if y + g.height() > avail.bottom() - 2:
-            y = avail.bottom() - 2 - g.height()
-        if y < avail.top():
-            y = avail.top()
-        if x + g.width() > avail.right() + 1:
-            x = avail.right() + 1 - g.width()
-        if x < avail.left():
-            x = avail.left()
-        if (x, y) != (g.x(), g.y()):
-            self.move(x, y)
+        rect = self._fit_rect(g)
+        if rect.topLeft() != g.topLeft():
+            self.move(rect.topLeft())
 
     def _expand_settle(self):
         """ 展开后校准：布局可能还差一次重算，重新量一次高度再落屏 """
@@ -2010,10 +2056,11 @@ class SentinelWindow(QWidget):
         before = self.geometry()
         need = self.sizeHint().height()
         if abs(need - self.height()) > 1:
-            right = before.right()
-            self.resize(self.PANEL_WIDTH, need)
             y = self._anchor_top if self._anchor_top is not None else before.y()
-            self.move(right - self.PANEL_WIDTH + 1, y)
+            # 位置+尺寸一次提交：先 resize 再 move 会漏一帧中间态
+            rect = self._fit_rect(QRect(before.right() + 1 - self.PANEL_WIDTH,
+                                        y, self.PANEL_WIDTH, need))
+            self.setGeometry(rect)
         self._fit_on_screen()
         if self.geometry().topLeft() != before.topLeft():
             # 被屏幕边界顶上去了 → 玻璃里那张背景已经对不上，重新抓一次
@@ -2041,11 +2088,15 @@ class SentinelWindow(QWidget):
 
     def _after_drag(self):
         self._anchor_top = self.y()
-        # 挪过位置后背景就变了，延迟重抓一次（晚一点抓，拖完的瞬间别闪）
         if self._expanded:
+            # 拖过之后小球的新家就是窗口右边缘，收起时按这个位置还回去
+            self._collapsed_geo = QRect(self.geometry().right() + 1 - self.ball.px(),
+                                        self.y(), self.ball.px(), self.ball.px())
+            # 挪过位置后背景就变了，延迟重抓一次（晚一点抓，拖完的瞬间别闪）
             self._fit_on_screen()
             QTimer.singleShot(220, lambda: self._snap_backdrop(0))
         else:
+            self._collapsed_geo = QRect(self.geometry())
             QTimer.singleShot(400, self._prefetch_backdrop)
 
 
