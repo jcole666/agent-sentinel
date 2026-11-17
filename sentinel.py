@@ -944,16 +944,19 @@ def run_net_watcher(store, agents, stop_event):
     用户早就干完活了，面板还一直显示「工作中」。
 
     现在外部连接只当闸门，真正算活跃要满足下面任一：
-      - 本轮进程树 IO 增量 >= io_min_bytes：心跳只有 ~300B，真实对话的
-        请求体 + 流式响应至少 KB 级；
-      - 同一个外部端点已连续存在 >= persist_seconds：模型长时间思考时
-        连接一直挂着却几乎没流量，靠这条兜；心跳只活 5 秒左右，不会误触。
+      - **连续两轮**进程树 IO 增量 >= io_min_bytes。只看单轮不够：它有一次性
+        的启动同步（走 Clash 代理 127.0.0.1:7890，实测单轮 22KB 然后彻底安静），
+        而空闲心跳是单轮 300B —— 两者都是「一轮就安静」；真实流式回复会持续
+        几秒以上，必然跨两轮。
+      - 同一个**真远端**端点已连续存在 >= persist_seconds：模型长时间思考时
+        连接一直挂着却几乎没流量，靠这条兜。心跳只活 4~5 秒不会误触；
+        本机代理连接活得久也不作数（Clash 会长期挂着一条到 7890 的连接）。
 
     其余状态机沿用：活跃后维持 done_seconds 为 working，再 done 一段，最后 idle。 """
     watched = [(a["id"], a["watch_net"]) for a in agents if a.get("watch_net")]
     if not watched:
         return
-    streak = {}        # aid -> 连续命中「真活跃」的轮数（防抖）
+    burst = {}         # aid -> 连续「这一轮有流量」的轮数
     last_active = {}   # aid -> 最后一次真活跃的时间
     seen_at = {}       # aid -> {端点: 首次看到的时间}
     prev_io = {}       # aid -> 上一轮进程树 IO 累计值
@@ -979,7 +982,7 @@ def run_net_watcher(store, agents, stop_event):
                         if (p.info["name"] or "").lower() == pname]
                 if not pids:
                     had = aid in last_active or aid in seen_at
-                    for d in (streak, last_active, seen_at, prev_io):
+                    for d in (burst, last_active, seen_at, prev_io):
                         d.pop(aid, None)
                     if had:      # 只在「刚退出」这一轮上报，避免每 3 秒写一次 state.json
                         store.report(aid, "idle", task_id=TASK_ID)
@@ -1011,7 +1014,11 @@ def run_net_watcher(store, agents, stop_event):
                 for e in eps:
                     first.setdefault(e, now)
                 persist_sec = float(cfg.get("persist_seconds", 12))
-                persist = any(now - t >= persist_sec for t in first.values())
+                # 只认「真远端」连接的长寿：本机代理（Clash 之类）会长期挂着一条
+                # 到 127.0.0.1:7890 的连接，它活得久不代表在对话
+                persist = any(now - t >= persist_sec
+                              for e, t in first.items()
+                              if not is_loopback(e.rsplit(":", 1)[0]))
 
                 # 这一轮的进程树 IO 增量（含网络收发）
                 cpu, io, _n = _proc_tree_cpu_io(pname)
@@ -1020,22 +1027,19 @@ def run_net_watcher(store, agents, stop_event):
                 d_io = 0 if old is None else max(0, io - old[1])
                 d_cpu = 0.0 if old is None else max(0.0, cpu - old[0])
                 io_min = float(cfg.get("io_min_bytes", 1200))
-                burst = d_io >= io_min
+                # **连续两轮**都有流量才算：启动时的一次性同步（实测一轮 22KB）
+                # 和空闲心跳（一轮 300B）都是「一轮就安静」，不能算对话；
+                # 真实的流式回复至少持续几秒，必然跨两轮。
+                burst[aid] = burst.get(aid, 0) + 1 if d_io >= io_min else 0
+                need = int(cfg.get("confirm_rounds", 2))
 
-                if eps and (persist or burst):
-                    streak[aid] = streak.get(aid, 0) + 1
-                    # 流量很大（握手+请求体）时一轮就够，其余要连续两轮
-                    need = 1 if d_io >= io_min * 8 else 2
-                    if streak[aid] >= need:
-                        if aid not in last_active:
-                            # 只在「刚开始活动」时记一行，方便以后回来对阈值
-                            launch_log("net 活跃 %s：io=%dB cpu=%.0fms 端点=%s 连接已挂%.0fs"
-                                       % (aid, d_io, d_cpu * 1000,
-                                          ",".join(sorted(eps)),
-                                          max([now - t for t in first.values()] or [0])))
-                        last_active[aid] = now
-                else:
-                    streak[aid] = 0
+                if eps and (persist or burst[aid] >= need):
+                    if aid not in last_active:
+                        # 只在「刚开始活动」时记一行，方便以后回来对阈值
+                        launch_log("net 活跃 %s：io=%dB cpu=%.0fms 端点=%s 连续%d轮"
+                                   % (aid, d_io, d_cpu * 1000,
+                                      ",".join(sorted(eps)), burst.get(aid, 0)))
+                    last_active[aid] = now
 
                 # 任务名仍取窗口标题（标题里没有任务名就用占位）
                 name = ""

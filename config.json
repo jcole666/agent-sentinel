@@ -46,6 +46,7 @@
         "title_suffix": "DeepSeek Harness",
         "done_seconds": 60,
         "io_min_bytes": 1200,
+        "confirm_rounds": 2,
         "persist_seconds": 12
       }
     },
