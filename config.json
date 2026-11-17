@@ -44,7 +44,9 @@
       "watch_net": {
         "process": "deepseek harness.exe",
         "title_suffix": "DeepSeek Harness",
-        "done_seconds": 60
+        "done_seconds": 60,
+        "io_min_bytes": 1200,
+        "persist_seconds": 12
       }
     },
     {

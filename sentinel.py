@@ -931,14 +931,38 @@ def run_net_watcher(store, agents, stop_event):
 
     原理：流式生成回复期间，应用必须持有一条到 API 端点（或本地代理）的
     ESTABLISHED 连接；空闲时只剩进程间 IPC（连到自己监听端口的回环连接）。
-    所以：出现外部连接 = 对话进行中；连接消失 = 对话结束。
-    比窗口标题 / CPU 都准——标题对话结束后不变，CPU 会被界面定时刷新干扰。 """
+
+    **但「有外部连接」本身不算活跃。** 实测该应用空闲时每 30 秒会向
+    `118.178.129.217:443` 发一次保活/遥测，连接存活 4.0~4.6 秒，全程只走
+    ~300 字节：
+
+        17.2s  + 连接 118.178.129.217:443   ioΔ=303B   存活 4.0s
+        47.0s  + 连接 118.178.129.217:443   ioΔ=0      存活 4.6s
+
+    旧逻辑「连续 2 轮（6 秒）看到外部连接就算活跃」正好被这个心跳命中，
+    而心跳间隔 30 秒 < done_seconds=60，last_active 被无限刷新 →
+    用户早就干完活了，面板还一直显示「工作中」。
+
+    现在外部连接只当闸门，真正算活跃要满足下面任一：
+      - 本轮进程树 IO 增量 >= io_min_bytes：心跳只有 ~300B，真实对话的
+        请求体 + 流式响应至少 KB 级；
+      - 同一个外部端点已连续存在 >= persist_seconds：模型长时间思考时
+        连接一直挂着却几乎没流量，靠这条兜；心跳只活 5 秒左右，不会误触。
+
+    其余状态机沿用：活跃后维持 done_seconds 为 working，再 done 一段，最后 idle。 """
     watched = [(a["id"], a["watch_net"]) for a in agents if a.get("watch_net")]
     if not watched:
         return
-    streak = {}        # aid -> 连续检测到外部连接的次数（防抖）
-    last_active = {}   # aid -> 最后一次有外部连接的时间
+    streak = {}        # aid -> 连续命中「真活跃」的轮数（防抖）
+    last_active = {}   # aid -> 最后一次真活跃的时间
+    seen_at = {}       # aid -> {端点: 首次看到的时间}
+    prev_io = {}       # aid -> 上一轮进程树 IO 累计值
     TASK_ID = "net"
+
+    # 清掉上次退出时残留的 net 任务：新逻辑平时不再每轮上报，
+    # 这个残留没人会去结束，会一直挂在面板上显示「工作中」。
+    for aid, _cfg in watched:
+        store.report(aid, "idle", task_id=TASK_ID)
 
     def is_loopback(ip):
         return ip.startswith("127.") or ip == "::1"
@@ -954,9 +978,10 @@ def run_net_watcher(store, agents, stop_event):
                 pids = [p.pid for p in psutil.process_iter(["name"])
                         if (p.info["name"] or "").lower() == pname]
                 if not pids:
-                    streak.pop(aid, None)
-                    if aid in last_active:
-                        last_active.pop(aid, None)
+                    had = aid in last_active or aid in seen_at
+                    for d in (streak, last_active, seen_at, prev_io):
+                        d.pop(aid, None)
+                    if had:      # 只在「刚退出」这一轮上报，避免每 3 秒写一次 state.json
                         store.report(aid, "idle", task_id=TASK_ID)
                     continue
 
@@ -971,15 +996,43 @@ def run_net_watcher(store, agents, stop_event):
                 # 本进程树所有连接的本地端口集合：同一条进程间连接会从两端各看到一次，
                 # 从主进程一侧看时远端端口是渲染进程的临时端口，必须也排除掉。
                 local_ports = {c.laddr.port for c in conns if c.laddr}
-                ext = any(
-                    c.status == "ESTABLISHED" and c.raddr and
-                    not (is_loopback(c.raddr.ip) and
-                         (c.raddr.port in listen_ports or c.raddr.port in local_ports))
-                    for c in conns)
+                eps = {"%s:%s" % (c.raddr.ip, c.raddr.port)
+                       for c in conns
+                       if c.status == "ESTABLISHED" and c.raddr and
+                       not (is_loopback(c.raddr.ip) and
+                            (c.raddr.port in listen_ports or
+                             c.raddr.port in local_ports))}
 
-                if ext:
+                # 每个外部端点已经挂了多久
+                first = seen_at.setdefault(aid, {})
+                for e in list(first):
+                    if e not in eps:
+                        first.pop(e, None)
+                for e in eps:
+                    first.setdefault(e, now)
+                persist_sec = float(cfg.get("persist_seconds", 12))
+                persist = any(now - t >= persist_sec for t in first.values())
+
+                # 这一轮的进程树 IO 增量（含网络收发）
+                cpu, io, _n = _proc_tree_cpu_io(pname)
+                old = prev_io.get(aid)
+                prev_io[aid] = (cpu, io)
+                d_io = 0 if old is None else max(0, io - old[1])
+                d_cpu = 0.0 if old is None else max(0.0, cpu - old[0])
+                io_min = float(cfg.get("io_min_bytes", 1200))
+                burst = d_io >= io_min
+
+                if eps and (persist or burst):
                     streak[aid] = streak.get(aid, 0) + 1
-                    if streak[aid] >= 2:          # 连续两轮才算，过滤瞬时请求
+                    # 流量很大（握手+请求体）时一轮就够，其余要连续两轮
+                    need = 1 if d_io >= io_min * 8 else 2
+                    if streak[aid] >= need:
+                        if aid not in last_active:
+                            # 只在「刚开始活动」时记一行，方便以后回来对阈值
+                            launch_log("net 活跃 %s：io=%dB cpu=%.0fms 端点=%s 连接已挂%.0fs"
+                                       % (aid, d_io, d_cpu * 1000,
+                                          ",".join(sorted(eps)),
+                                          max([now - t for t in first.values()] or [0])))
                         last_active[aid] = now
                 else:
                     streak[aid] = 0
@@ -1005,9 +1058,9 @@ def run_net_watcher(store, agents, stop_event):
                     store.report(aid, "working", name or "对话中", task_id=TASK_ID)
                 elif aid in last_active and quiet < done_sec * 3:
                     store.report(aid, "done", name or "对话", task_id=TASK_ID)
-                else:
-                    if aid in last_active:
-                        last_active.pop(aid, None)
+                elif aid in last_active:
+                    # 只在「刚回到空闲」这一轮上报，之后不再每轮写 state.json
+                    last_active.pop(aid, None)
                     store.report(aid, "idle", task_id=TASK_ID)
         except Exception:
             pass
