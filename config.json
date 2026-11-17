@@ -8,13 +8,19 @@
       "id": "claude-code",
       "label": "Claude Code",
       "kind": "cli",
-      "proc_match": { "name": "", "path_contains": "claude-cli-nodejs" }
+      "proc_match": { "name": "claude.exe", "path_contains": "claude-code" },
+      "open": {
+        "launch": ["wt.exe", "-d", "%USERPROFILE%", "cmd", "/k", "F:\\npm-global\\claude.cmd"]
+      }
     },
     {
       "id": "claude-desktop",
       "label": "Claude Desktop",
       "kind": "gui",
       "proc_match": { "name": "claude.exe", "path_contains": "windowsapps\\claude_" },
+      "open": {
+        "launch": ["explorer.exe", "shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude"]
+      },
       "watch_json": {
         "session_glob": [
           "%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\*\\00000000\\local_*.json",
@@ -29,6 +35,10 @@
       "label": "Codex",
       "kind": "cli",
       "proc_match": { "name": "codex.exe", "path_contains": "openai\\codex" },
+      "open": {
+        "launch": ["wt.exe", "-d", "%USERPROFILE%", "cmd", "/k",
+                   "C:\\Users\\Leneve\\AppData\\Local\\OpenAI\\Codex\\bin\\*\\codex.exe"]
+      },
       "watch_turns": {
         "turns_db_glob": "%USERPROFILE%\\.codex\\thread_history_*.sqlite",
         "threads_db_glob": "%USERPROFILE%\\.codex\\state_*.sqlite",
@@ -41,6 +51,9 @@
       "label": "DeepSeek Harness",
       "kind": "gui",
       "proc_match": { "name": "deepseek harness.exe", "path_contains": "deepseekharness" },
+      "open": {
+        "launch": ["F:\\APP\\Deepseekharness\\DeepSeek Harness.exe"]
+      },
       "watch_net": {
         "process": "deepseek harness.exe",
         "title_suffix": "DeepSeek Harness",
@@ -55,6 +68,9 @@
       "label": "WorkBuddy 国内版",
       "kind": "gui",
       "proc_match": { "name": "workbuddy.exe", "path_contains": "" },
+      "open": {
+        "launch": ["F:\\APP\\WorkBuddy\\WorkBuddy.exe"]
+      },
       "watch_db": { "path": "%USERPROFILE%\\.workbuddy\\workbuddy.db", "active_minutes": 8 }
     },
     {
@@ -62,6 +78,9 @@
       "label": "WorkBuddy 国际版",
       "kind": "gui",
       "proc_match": { "name": "workbuddyai.exe", "path_contains": "" },
+      "open": {
+        "launch": ["E:\\WorkBuddyAI\\WorkBuddyAI.exe"]
+      },
       "watch_db": { "path": "%USERPROFILE%\\.workbuddy-ai\\workbuddy.db", "active_minutes": 8 }
     },
     {
@@ -69,6 +88,9 @@
       "label": "Cursor",
       "kind": "gui",
       "proc_match": { "name": "cursor.exe", "path_contains": "" },
+      "open": {
+        "launch": ["E:\\cursor\\Cursor.exe"]
+      },
       "watch_cursor": {
         "transcript_glob": "%USERPROFILE%\\.cursor\\projects\\*\\agent-transcripts\\*\\*.jsonl",
         "active_seconds": 300,
@@ -80,6 +102,9 @@
       "label": "Grok Bot",
       "kind": "gui",
       "proc_match": { "name": "grok bot.exe", "path_contains": "" },
+      "open": {
+        "launch": ["F:\\APP\\Grok Bot\\Grok Bot.exe"]
+      },
       "watch_grok": {
         "process": "grok bot.exe",
         "window_rounds": 3,

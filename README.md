@@ -60,8 +60,58 @@ Windows 下双击 `启动哨兵.vbs` 可静默后台启动（`python make_launch
 - **安静模式**（默认开启）：空闲时静止 2.6 秒才缓慢呼吸一轮，干活/待审批动画整体放慢 1.6～2 倍，刷新率降到 12fps——不吵。想恢复官方原速，把 `config.json` 里的 `pet.calm` 改成 `false`
 - 宠物永远置顶；**滚轮缩放**（0.7×～3.0×），或**右键宠物**选预设尺寸，尺寸自动记忆
 - **点宠物**：原地展开/收起面板（面板向左展开，宠物不动）；**按住拖动**：移动位置
-- 面板里：**鼠标悬停**某一行会浮起（描边变亮 + 跟随鼠标的柔光）；右键某一行手动标记，双击行=快捷完成，︿ 收回，— 隐藏到托盘
-- 面板**始终整窗落在屏幕可用区内**：任务变多把窗口撑高时，会自动上移让出屏幕底边（不会让 Windows 把最后一行切掉）；任务减少后再回到你原来的位置
+- 面板里：**鼠标悬停**某一行会浮起（描边变亮 + 跟随鼠标的柔光 + 右侧出现「↗ 打开」）；右键某一行手动标记，双击行=快捷完成，︿ 收回，— 隐藏到托盘
+- **点某一行 = 切到那个 Agent 的应用**（详见下一节）；面板**始终整窗落在屏幕可用区内**：任务变多把窗口撑高时，会自动上移让出屏幕底边（不会让 Windows 把最后一行切掉）；任务减少后再回到你原来的位置
+
+## 点一行：切窗口 / 帮你打开
+
+左键点一行，做三件事里最合适的那件：
+
+1. 窗口已经开着（含**最小化**、含**关到托盘只 hide** 的）→ 还原并切到前台；
+2. 进程没跑 → 按 `config.json` 的 `open.launch` 启动它，等窗口出现后再切到前台；
+3. 进程在跑但找不到窗口（比如 CLI 挂在后台）→ 只在行内提示「在跑，但没找到窗口」，不重复启动。
+
+结果会用一句话闪在那一行的第二行（`已切到前台` / `已启动` / `启动失败`），随后面板
+自动收回小球——你要看的是那个应用，面板不该挡着。
+
+**怎么找到"那个窗口"**（`find_agent_window`）：按 `proc_match` 拿到该 Agent 的所有 pid，
+再枚举顶层窗口比对 pid，多个候选里挑「非工具窗口 + 面积最大」的。两层兜底：
+
+- **祖先进程**：CLI 类（Claude Code / Codex）自己没有窗口，窗口属于装着它的终端。
+  进程树是 `WindowsTerminal → OpenConsole → shell → cli`，往上走 4 层就能命中终端窗口
+  （遇到 `explorer.exe` / `svchost.exe` 就停——那是全机的爹，算进来会命中满屏窗口）。
+- **隐藏窗口**：有些 Electron 应用关窗只是 `hide`，窗口还在。这类窗口 `IsWindowVisible`
+  是 0，但 `ShowWindow(SW_SHOW)` 就能叫回来，比重新起一个实例干净。只认够大的
+  （≥320×240）且非工具窗口的，避开输入法/托盘提示框。
+
+**怎么把它切到前台**（`focus_window`）：Windows 默认不许后台进程抢焦点，硬
+`SetForegroundWindow` 经常只是任务栏闪一下。做法是 `AttachThreadInput` 把当前线程
+挂到前台线程的输入队列上，再 `BringWindowToTop` + `SetForegroundWindow`，完事摘掉。
+窗口是最小化态就先 `SW_RESTORE`。
+
+**启动命令**（`config.json` 每个 agent 的 `open`）：
+
+```json
+"open": { "launch": ["F:\\APP\\Grok Bot\\Grok Bot.exe"] }
+```
+
+- 任意一项可以带通配符，取 mtime 最新的那个 —— Codex 是
+  `...\OpenAI\Codex\bin\*\\codex.exe`，它每次更新都换目录名；
+- CLI 类用 Windows Terminal 起一个窗口：
+  `["wt.exe", "-d", "%USERPROFILE%", "cmd", "/k", "F:\\npm-global\\claude.cmd"]`；
+- UWP/MSIX 应用走 `explorer.exe shell:AppsFolder\\<PackageFamily>!<AppId>`；
+- 启动用 `DETACHED_PROCESS` 分离出去 —— 哨兵重启或退出不会把刚打开的应用一起带走。
+
+脚本也能触发（等价于点一下某一行，会等结果返回）：
+
+```bash
+curl -X POST http://127.0.0.1:17890/api/open -d '{"agent":"cursor"}'
+# {"agent":"cursor","ok":true,"msg":"已切到前台"}
+```
+
+> 坑：单击要等 240ms 才生效——双击的第一下也是 press，不等这一手，双击标记完成会先
+> 把应用切走。另外**找窗口要遍历进程表**，个别 agent（只按路径匹配、不限进程名的）
+> 会挨个读 exe 路径，冷启动那次能到 1 秒，所以整段放在后台线程做，结果用信号回主线程。
 
 ## 界面：液态玻璃
 
@@ -375,6 +425,7 @@ Grok Bot（内部代号 sand）的对话跑在**远端沙箱**里，本地拿不
 | `GET /api/ping` | 探活 |
 | `GET /api/show` | 把已运行的窗口叫回前台（不会开第二个实例） |
 | `GET /api/toggle` | 展开/收起面板（脚本或二次开发用） |
+| `POST /api/open` | 切到/启动某个 Agent 的应用（等价于点一行），body `{"agent":"cursor"}` |
 
 - `agent`：`config.json` 里的 id
 - `state`：`idle` / `working` / `approval` / `done` / `error`
@@ -382,6 +433,12 @@ Grok Bot（内部代号 sand）的对话跑在**远端沙箱**里，本地拿不
 - 每个 Agent 最多保留 5 条任务，超过 6 小时自动清理
 
 ## Claude Code 接入（自动上报）
+
+> 进程匹配：Claude Code CLI 装成 npm 包时是
+> `...\node_modules\@anthropic-ai\claude-code\bin\claude.exe`，和 Claude Desktop 的
+> `...\WindowsApps\Claude_*\app\Claude.exe` **同名**。所以两边的 `proc_match` 靠路径区分：
+> CLI 认 `path_contains: "claude-code"`，桌面版认 `path_contains: "windowsapps\\claude_"`。
+> （早先按 `claude-cli-nodejs` 匹配是错的，那一版永远显示「未运行」。）
 
 合并进 `~/.claude/settings.json`：
 

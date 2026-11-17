@@ -201,6 +201,16 @@ class UiBridge(QObject):
     """HTTP 线程 -> Qt 主线程 的桥。"""
     show_requested = Signal()
     toggle_requested = Signal()
+    open_requested = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.open_result = None
+        self._ev = threading.Event()
+
+    def set_open_result(self, aid, ok, msg):
+        self.open_result = {"agent": aid, "ok": ok, "msg": msg}
+        self._ev.set()
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -241,6 +251,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path.split("?")[0].rstrip("/") == "/api/open":
+            # 脚本/自动化用：跟点一下某一行效果一样
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._send(400, {"error": "bad json"})
+                return
+            aid = str(payload.get("agent", ""))
+            br = self.bridge
+            if br is None:
+                self._send(503, {"ok": False, "error": "ui not ready"})
+                return
+            br.open_result = None
+            br._ev.clear()
+            br.open_requested.emit(aid)
+            br._ev.wait(5.0)
+            self._send(200, br.open_result or {"agent": aid, "ok": False,
+                                               "msg": "超时"})
+            return
         if not self.path.startswith("/api/status"):
             self._send(404, {"error": "not found"})
             return
@@ -275,8 +305,11 @@ def run_http_server(store, stop_event):
 # ---------------------------------------------------------------- 进程监控
 
 
-def enum_windows():
-    """ 枚举可见窗口 -> [(hwnd, title, pid)]，仅 Windows """
+def enum_windows(visible_only=True, need_title=True):
+    """ 枚举顶层窗口 -> [(hwnd, title, pid)]，仅 Windows。
+
+        visible_only=False 时连「藏进托盘」的窗口也一起枚举 —— 有些应用
+        （比如 WorkBuddy）关窗只是 hide，窗口还在，只是看不见。 """
     if os.name != "nt":
         return []
     try:
@@ -287,19 +320,243 @@ def enum_windows():
         out = []
 
         def cb(hwnd, _):
-            if user32.IsWindowVisible(hwnd):
-                n = user32.GetWindowTextLengthW(hwnd)
-                buf = ctypes.create_unicode_buffer(n + 1)
-                user32.GetWindowTextW(hwnd, buf, n + 1)
-                pid = wintypes.DWORD()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if buf.value.strip():
-                    out.append((hwnd, buf.value.strip(), pid.value))
+            if visible_only and not user32.IsWindowVisible(hwnd):
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if buf.value.strip() or not need_title:
+                out.append((hwnd, buf.value.strip(), pid.value))
             return True
         user32.EnumWindows(proto(cb), 0)
         return out
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------- 打开 / 切到前台
+
+SW_SHOW = 5
+SW_RESTORE = 9
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+def _win_rect(hwnd):
+    """ 窗口矩形 (x, y, w, h)，失败给全 0 """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return (r.left, r.top, max(0, r.right - r.left), max(0, r.bottom - r.top))
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+def _is_tool_window(hwnd):
+    """ 工具窗口（托盘气泡、悬浮提示一类）不该被当成主窗口 """
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetWindowLongW(hwnd, -20) & 0x00000080)
+    except Exception:
+        return False
+
+
+def agent_pids(agent):
+    """ cfg.proc_match 命中的全部进程 pid（与进程监控用同一套规则） """
+    match = agent.get("proc_match") or {}
+    name_eq = (match.get("name") or "").lower()
+    path_has = (match.get("path_contains") or "").lower()
+    if not (name_eq or path_has):
+        return []
+    out = []
+    for p in psutil.process_iter(["name"]):
+        try:
+            n = (p.info["name"] or "").lower()
+        except Exception:
+            continue
+        if name_eq and n != name_eq:
+            continue
+        if path_has:
+            # 只在名字已经对上时才去读 exe 路径：读 exe 会碰到访问受限的系统进程，
+            # 全表读一遍能拖到 1~2 秒
+            try:
+                e = (p.exe() or "").lower()
+            except Exception:
+                continue
+            if path_has not in e:
+                continue
+        out.append(p.pid)
+    return out
+
+
+def find_agent_window(agent):
+    """ 该 Agent 的主窗口 -> (hwnd, title)；没有则 (None, "")。
+
+        顺序：
+        1. 可见窗口、pid 直接命中 —— 绝大多数 GUI 应用就这样找到；
+        2. 可见窗口、祖先进程命中 —— CLI 类（Claude Code / Codex）自己没有窗口，
+           窗口属于装着它的终端（WindowsTerminal → OpenConsole → shell → cli）；
+        3. 藏进托盘的窗口 —— 有些应用（WorkBuddy）关窗只是 hide，窗口还在，
+           直接 ShowWindow 就能叫回来，不必重启一个实例。 """
+    pids = set(agent_pids(agent))
+    if not pids:
+        return None, ""
+
+    def score(w):
+        hwnd, _title, _pid = w
+        _x, _y, ww, hh = _win_rect(hwnd)
+        return (0 if _is_tool_window(hwnd) else 1, ww * hh)
+
+    def pick(pool, visible):
+        hits = [w for w in enum_windows(visible_only=visible) if w[2] in pool]
+        if not visible:
+            # 隐藏窗口里一堆 0×0 的输入法/提示框，只认够大的主窗口
+            hits = [w for w in hits
+                    if not _is_tool_window(w[0])
+                    and (lambda r: r[2] >= 320 and r[3] >= 240)(_win_rect(w[0]))]
+        if hits:
+            hits.sort(key=score, reverse=True)
+            return hits[0][0], hits[0][1]
+        return None, ""
+
+    hwnd, title = pick(pids, True)
+    if hwnd:
+        return hwnd, title
+
+    # 祖先进程：往上最多 4 层，碰到 explorer/svchost 就停（那是全机的爹）
+    anc = set()
+    for pid in pids:
+        try:
+            p = psutil.Process(pid).parent()
+        except Exception:
+            continue
+        for _ in range(4):
+            if p is None:
+                break
+            try:
+                nm = (p.name() or "").lower()
+            except Exception:
+                break
+            if nm in ("explorer.exe", "svchost.exe", "services.exe"):
+                break
+            anc.add(p.pid)
+            try:
+                p = p.parent()
+            except Exception:
+                p = None
+    if anc:
+        hwnd, title = pick(anc, True)
+        if hwnd:
+            return hwnd, title
+
+    return pick(pids, False)
+
+
+def focus_window(hwnd):
+    """ 把窗口切到前台（最小化则先还原）。
+
+        前台锁：Windows 默认不允许后台进程抢焦点。临时把自己的输入队列
+        挂到当前前台线程上（AttachThreadInput），就能名正言顺地
+        SetForegroundWindow。不这么做经常「调不动」，只是任务栏闪一下。 """
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, SW_RESTORE)
+        else:
+            u.ShowWindow(hwnd, SW_SHOW)     # 藏进托盘的（hide 而非 minimize）也能叫回来
+        fg = u.GetForegroundWindow()
+        if fg == hwnd:
+            return True
+        t_fg = u.GetWindowThreadProcessId(fg, None)
+        t_me = k.GetCurrentThreadId()
+        attached = False
+        if t_fg and t_fg != t_me:
+            attached = bool(u.AttachThreadInput(t_me, t_fg, True))
+        try:
+            u.BringWindowToTop(hwnd)
+            u.SetForegroundWindow(hwnd)
+            u.SetFocus(hwnd)
+        finally:
+            if attached:
+                u.AttachThreadInput(t_me, t_fg, False)
+        return u.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
+def launch_agent(agent):
+    """ 按 config 里 open.launch 启动应用 -> (ok, 提示语)。
+
+        launch 里任意一项都可以带通配符（如 Codex 的
+        bin\\*\\codex.exe —— 它每次更新都换目录名），取最新的那个。 """
+    spec = (agent.get("open") or {}).get("launch")
+    if not spec:
+        return False, "没配启动命令"
+    if isinstance(spec, str):
+        spec = [spec]
+    args = []
+    for a in spec:
+        a = os.path.expandvars(os.path.expanduser(str(a)))
+        if "*" in a:
+            import glob as _glob
+            hits = _glob.glob(a)
+            if not hits:
+                return False, "找不到程序"
+            a = max(hits, key=os.path.getmtime)
+        args.append(a)
+    if not args:
+        return False, "没配启动命令"
+    cwd = os.path.expandvars(os.path.expanduser(
+        (agent.get("open") or {}).get("cwd") or "")) or None
+    try:
+        if len(args) == 1 and args[0].lower().startswith("shell:"):
+            os.startfile(args[0])
+        else:
+            # 分离出去：哨兵重启/退出不能把刚打开的应用一起带走
+            subprocess.Popen(args, cwd=cwd, close_fds=True,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        return True, "已启动"
+    except Exception as e:
+        launch_log("launch %s 失败：%s" % (agent.get("id"), e))
+        return False, "启动失败"
+
+
+def _focus_when_ready(agent, timeout=25.0):
+    """ 刚启动的应用窗口要过几秒才出现；等它出来再切前台，
+        否则会开在别的窗口后面，用户还得自己找。只切一次。 """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        hwnd, _title = find_agent_window(agent)
+        if hwnd:
+            time.sleep(0.6)          # 让首帧画完再抢焦点
+            focus_window(hwnd)
+            return
+        time.sleep(0.6)
+
+
+def open_agent(agent):
+    """ 点一行的动作：窗口在 → 切到前台；没运行 → 启动。 -> (ok, 提示语) """
+    hwnd, title = find_agent_window(agent)
+    if hwnd:
+        if focus_window(hwnd):
+            return True, "已切到前台"
+        return False, "切不过去（可能以管理员运行）"
+    if agent_pids(agent):
+        return False, "在跑，但没找到窗口"
+    ok, msg = launch_agent(agent)
+    if ok:
+        threading.Thread(target=_focus_when_ready, args=(agent,),
+                         daemon=True).start()
+    return ok, msg
 
 
 def run_turn_watcher(store, agents, stop_event):
@@ -1150,25 +1407,35 @@ def run_window_watcher(store, agents, stop_event):
 
 
 def run_proc_watcher(store, agents, stop_event):
+    exe_cache = {}      # pid -> exe 小写；读 exe 比读 name 慢一个量级，只在名字先对上时去读
     while not stop_event.is_set():
         try:
             procs = []
-            for p in psutil.process_iter(["name", "exe"]):
+            for p in psutil.process_iter(["name"]):
                 try:
-                    procs.append(((p.info["name"] or "").lower(),
-                                  (p.info["exe"] or "").lower()))
+                    procs.append((p.pid, (p.info["name"] or "").lower()))
                 except Exception:
                     continue
+            if len(exe_cache) > 3000:
+                exe_cache.clear()
             for a in agents:
                 match = a.get("proc_match", {})
                 name_eq = (match.get("name") or "").lower()
                 path_has = (match.get("path_contains") or "").lower()
                 running = False
-                for pname, pexe in procs:
+                for pid, pname in procs:
                     if name_eq and pname != name_eq:
                         continue
-                    if path_has and path_has not in pexe:
-                        continue
+                    if path_has:
+                        exe = exe_cache.get(pid)
+                        if exe is None:
+                            try:
+                                exe = (psutil.Process(pid).exe() or "").lower()
+                            except Exception:
+                                exe = ""
+                            exe_cache[pid] = exe
+                        if path_has not in exe:
+                            continue
                     if name_eq or path_has:
                         running = True
                         break
@@ -1319,6 +1586,7 @@ class GlassPanel(QWidget):
 class AgentRow(QWidget):
     """ 一个 Agent 一张液态玻璃卡片；有多个任务时卡片自动变高 """
 
+    activated = Signal()      # 单击：切到 / 打开对应的应用
     PAD_X = 13
     LINE1 = 20          # 首行（名字/状态）基线区高度
     LINE2 = 14          # 次行（任务描述）高度
@@ -1345,6 +1613,15 @@ class AgentRow(QWidget):
         self._mouse = None
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._on_pulse)
+        # 单击要等一小会儿：双击的第一下也会先来一次 press，等不到第二下才算单击
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self.activated.emit)
+        self._flash_text = ""
+        self._flash_ok = True
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._clear_flash)
         self._relayout()
 
     # ---- 尺寸 / 动画 ----
@@ -1379,6 +1656,15 @@ class AgentRow(QWidget):
     def leaveEvent(self, e):
         self._start_anim(0.0)
         super().leaveEvent(e)
+
+    def reset_hover(self):
+        """ 面板收起时把悬停态清掉：光标留在里面就收起来的话，
+            leaveEvent 不会被调用，再展开会看到一行「卡住的高亮」。 """
+        self._anim.stop()
+        self._hover = 0.0
+        self._flash_timer.stop()
+        self._flash_text = ""
+        self.update()
 
     def _start_anim(self, target):
         self._anim.stop()
@@ -1421,6 +1707,7 @@ class AgentRow(QWidget):
         self._mouse = None
 
         self._relayout()
+        self._set_tip()
         self.update()
 
     # ---- 绘制 ----
@@ -1538,7 +1825,7 @@ class AgentRow(QWidget):
         p.setPen(color if self._state != "idle" else QColor("#8d95a3"))
         p.drawText(pill, Qt.AlignCenter, label)
 
-        # 任务描述（第二行）
+        # 任务描述（第二行）；点击后这里临时显示「已切到前台 / 已启动」
         tf = QFont(f)
         tf.setPixelSize(11)
         tf.setBold(False)
@@ -1546,12 +1833,23 @@ class AgentRow(QWidget):
         tcol = QColor("#5d6673") if not dim else QColor("#9aa1ac")
         if hv > 0.02:
             tcol = QColor("#3d4653") if not dim else QColor("#848b97")
+        line2 = self._flash_text or self._task_text
+        if self._flash_text:
+            tcol = QColor("#1f2937") if self._flash_ok else QColor("#9a3412")
         p.setPen(tcol)
         tfm = QFontMetrics(tf)
-        tmax = self.width() - self.PAD_X * 2 - 14
+        tmax = self.width() - self.PAD_X * 2 - 46     # 右侧留出「↗ 打开」的位置
         p.drawText(QRect(name_x, self.PAD_T + self.LINE1 - 4, tmax, self.LINE2),
                    Qt.AlignVCenter | Qt.AlignLeft,
-                   tfm.elidedText(self._task_text, Qt.ElideRight, tmax))
+                   tfm.elidedText(line2, Qt.ElideRight, tmax))
+        # 悬停提示：这一行是可以点开的
+        if hv > 0.03 and not self._flash_text:
+            hint = "↗ 打开"
+            hwid = tfm.horizontalAdvance(hint)
+            p.setPen(QColor(92, 104, 122, int(150 * hv)))
+            p.drawText(QRect(self.width() - self.PAD_X - hwid - 2,
+                             self.PAD_T + self.LINE1 - 4, hwid, self.LINE2),
+                       Qt.AlignVCenter | Qt.AlignRight, hint)
 
         # 额外任务
         if self._subs:
@@ -1572,8 +1870,30 @@ class AgentRow(QWidget):
                            sfm2.elidedText(line, Qt.ElideRight, tmax - 9))
                 y += self.SUB_H
 
+    def flash(self, text, ok=True, ms=1800):
+        """ 点完之后在第二行临时显示一句结果 """
+        self._flash_text = _oneline(text, 40)
+        self._flash_ok = ok
+        self._flash_timer.start(ms)
+        self.update()
+
+    def _clear_flash(self):
+        self._flash_text = ""
+        self.update()
+
+    def _set_tip(self):
+        act = "切到前台" if self._state != "idle" else "打开"
+        tip = "点击%s %s" % (act, self.agent["label"])
+        if tip != self.toolTip():
+            self.setToolTip(tip)
+
     def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            # 先等一手：双击的第一下也是 press，不能立刻打开
+            self._click_timer.start(240)
+            return
         if e.button() == Qt.RightButton:
+            self._click_timer.stop()
             menu = QMenu(self)
             for st, label in (("working", "标记：工作中"), ("approval", "标记：待审批"),
                               ("done", "标记：已完成"), ("idle", "清除全部任务")):
@@ -1583,7 +1903,8 @@ class AgentRow(QWidget):
             menu.exec(QCursor.pos())
 
     def mouseDoubleClickEvent(self, e):
-        # 双击快捷标记完成
+        # 双击快捷标记完成（并且取消这次单击要触发的打开）
+        self._click_timer.stop()
         self.store.report(self.agent["id"], "done")
 
 def manual_task(state):
@@ -1766,11 +2087,13 @@ class PetWidget(QWidget):
 
 class SentinelWindow(QWidget):
     PANEL_WIDTH = 404
+    open_done = Signal(str, bool, str)      # 后台找窗口/启动完成（aid, ok, 提示语）
 
     def __init__(self, agents, store, cfg=None):
         super().__init__()
         self.store = store
         self.cfg = cfg or {}
+        self.agents_by_id = {a["id"]: a for a in agents}
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._drag_offset = None
@@ -1831,10 +2154,11 @@ class SentinelWindow(QWidget):
         self.rows = []
         for a in agents:
             row = AgentRow(a, store)
+            row.activated.connect(lambda ag=a, r=row: self.open_agent_row(ag, r))
             lay.addWidget(row)
             self.rows.append((a["id"], row))
 
-        foot = QLabel("右键行=标记 · 双击行=完成 · 滚轮/右键宠物=调大小")
+        foot = QLabel("左键行=切到该应用 · 右键行=标记 · 双击行=完成 · 滚轮/右键宠物=调大小")
         foot.setStyleSheet("color:rgba(96,105,120,195); font-size:10px;"
                            " padding:1px 6px 0 6px; background:transparent;")
         lay.addWidget(foot)
@@ -1854,6 +2178,7 @@ class SentinelWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(600)
+        self.open_done.connect(self._on_open_done)
 
         self._apply_mode()
 
@@ -1861,6 +2186,49 @@ class SentinelWindow(QWidget):
     def toggle_expand(self):
         self._expanded = not self._expanded
         self._apply_mode()
+
+    # ---- 点一行：切到 / 打开对应应用 ----
+    def open_agent_row(self, agent, row=None):
+        """ 窗口在就切到前台，没运行就帮你打开。
+
+            找窗口要遍历进程表（个别 agent 得逐进程查 exe 路径，能到几百毫秒），
+            所以放后台线程做，结果再回主线程更新卡片 —— 不然点一下会卡一下。 """
+        if row is not None:
+            row.flash("处理中…", True, 3000)
+        threading.Thread(target=self._open_worker, args=(agent,), daemon=True).start()
+
+    def _open_worker(self, agent):
+        try:
+            ok, msg = open_agent(agent)
+        except Exception as e:
+            launch_log("open %s 异常：%s" % (agent.get("id"), e))
+            ok, msg = False, "打开失败"
+        self.open_done.emit(agent.get("id", ""), ok, msg)
+
+    def _on_open_done(self, aid, ok, msg):
+        row = dict(self.rows).get(aid)
+        if row is not None:
+            row.flash(msg, ok)
+        launch_log("open %s -> %s" % (aid, msg))
+        br = ApiHandler.bridge
+        if br is not None:
+            br.set_open_result(aid, ok, msg)
+        if ok:
+            # 用户要看的是那个应用，面板收起来别挡着（让提示语先闪一下）
+            QTimer.singleShot(480, self._collapse_after_open)
+
+    def open_agent_by_id(self, aid):
+        agent = self.agents_by_id.get(aid)
+        if agent is None:
+            br = ApiHandler.bridge
+            if br is not None:
+                br.set_open_result(aid, False, "没有这个 Agent")
+            return
+        self.open_agent_row(agent)
+
+    def _collapse_after_open(self):
+        if self._expanded:
+            self.toggle_expand()
 
     def apply_pet_size(self):
         """ 宠物缩放后：收起态同步窗口大小，保持右边缘不动 """
@@ -1954,6 +2322,8 @@ class SentinelWindow(QWidget):
             self._free_size()
             self.setGeometry(rect)                  # 先一次到位，此时面板已滑出窗口
             self.panel.setVisible(False)
+            for _aid, _row in self.rows:
+                _row.reset_hover()
             self.setFixedSize(w, w)
             self._collapsed_geo = QRect(rect)
 
@@ -2222,6 +2592,7 @@ def main():
     bridge = UiBridge()
     bridge.show_requested.connect(win.bring_to_front)
     bridge.toggle_requested.connect(win.toggle_expand)
+    bridge.open_requested.connect(win.open_agent_by_id)
     ApiHandler.bridge = bridge
     win.show()
     code = app.exec()
